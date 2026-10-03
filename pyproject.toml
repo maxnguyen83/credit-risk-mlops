@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "credit-risk-mlops"
+version = "0.1.0"
+description = "Credit default early-warning system — DDM501 final project"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "pyarrow==18.1.0",
+    "xlrd==2.0.1",
+    "requests==2.32.3",
+    "scikit-learn==1.5.2",
+    "lightgbm==4.5.0",
+    "shap==0.46.0",
+    "lime==0.2.0.1",
+    "fairlearn==0.11.0",
+    "mlflow==2.19.0",
+    # MLflow 2.19 imports FallbackAsyncAdaptedQueuePool, which SQLAlchemy 2.1
+    # removed. Without this pin, pip resolves 2.1.x and the tracking server
+    # dies on startup with an ImportError -- but only when a SQL backend store
+    # is configured, so it passes locally and fails in compose.
+    "sqlalchemy==2.0.36",
+    "boto3==1.35.90",
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "prometheus-client==0.21.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "ruff==0.8.4",
+    "mypy==1.14.0",
+    "types-requests",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["credit_risk"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: tests that need the full docker stack or train a model",
+    "needs_data: tests that require the raw dataset on disk",
+]
+
+[tool.coverage.run]
+source = ["src/credit_risk", "dags"]
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

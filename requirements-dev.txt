@@ -1,0 +1,11 @@
+# Generated from pyproject.toml [project.optional-dependencies].dev
+# Regenerate with: python scripts/gen_requirements.py
+
+-r requirements.txt
+
+pytest==8.3.4
+pytest-cov==6.0.0
+httpx==0.28.1
+ruff==0.8.4
+mypy==1.14.0
+types-requests

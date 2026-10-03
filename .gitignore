@@ -1,0 +1,34 @@
+# secrets — never commit
+.env
+
+# data artefacts
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# service state
+pg-data/
+minio-data/
+mlruns/
+logs/
+airflow.db
+standalone_admin_password.txt
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

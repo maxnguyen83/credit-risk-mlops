@@ -1,0 +1,49 @@
+# Airflow image.
+#
+# The interesting decision is the second virtualenv. Airflow 2.8.4 pins
+# pandas and numpy through its constraints file; this project pins newer ones
+# and additionally needs LightGBM, SHAP and LIME, which Airflow has no opinion
+# about. Installing both dependency sets into one interpreter means one of them
+# loses, silently, at import time.
+#
+# So the project gets its own interpreter at /opt/credit-risk/venv, and the DAG
+# shells out to it (CREDIT_RISK_PYTHON) instead of importing the project. Two
+# dependency sets, one image, no resolution conflict -- and the isolation is
+# visible rather than implicit.
+FROM apache/airflow:2.8.4-python3.11
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential libgomp1 curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Airflow's own extras, installed with its constraints so Airflow stays coherent.
+USER airflow
+# CONSTRAINTS_PY, not PYTHON_VERSION. The base image already exports
+# PYTHON_VERSION=3.11.8 as an ENV, and an ENV from the base beats an ARG default
+# inside RUN -- so the constraints URL silently became .../constraints-3.11.8.txt,
+# which does not exist, and the build failed with a 404 that looks nothing like a
+# name collision.
+ARG AIRFLOW_VERSION=2.8.4
+ARG CONSTRAINTS_PY=3.11
+RUN pip install --no-cache-dir \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${CONSTRAINTS_PY}.txt" \
+      "pyarrow==14.0.2" "requests"
+
+# The project, in its own venv, resolved independently of Airflow.
+USER root
+RUN python3.11 -m venv /opt/credit-risk/venv \
+ && chown -R airflow:0 /opt/credit-risk
+USER airflow
+
+COPY --chown=airflow:0 pyproject.toml README.md /opt/credit-risk/src-build/
+COPY --chown=airflow:0 src/ /opt/credit-risk/src-build/src/
+# PIP_USER=false for this layer only. The Airflow image exports PIP_USER=true so
+# that a bare `pip install` lands in the airflow user's home rather than the
+# system site-packages -- correct for Airflow, fatal here: pip refuses --user
+# inside a virtualenv and the build dies with a message that says nothing about
+# an inherited environment variable.
+RUN PIP_USER=false /opt/credit-risk/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && PIP_USER=false /opt/credit-risk/venv/bin/pip install --no-cache-dir /opt/credit-risk/src-build
+
+ENV CREDIT_RISK_PYTHON=/opt/credit-risk/venv/bin/python

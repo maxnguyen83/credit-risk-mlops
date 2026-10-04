@@ -38,7 +38,8 @@ which accounts to contact.
 **Where checks run.** "CI `test`" is the `test` job in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs every test not
 marked `slow` or `needs_data` on Python 3.11 and 3.12. Tests marked **(slow)** run
-in `make test` only. **(Airflow image)** means the test skips anywhere Airflow is
+in CI's `model` job, or in `data quality` when they need the dataset, and in
+`make test`. **(Airflow image)** means the test skips anywhere Airflow is
 not installed, CI included. Alert names refer to `monitoring/prometheus/alerts/`.
 
 ---
@@ -130,8 +131,6 @@ Stated here so that nobody reads a requirement above as met when it is not.
 - **Alert rules are checked for loading, not for firing.** CI confirms
   Prometheus loaded every rule. That each one fires on its condition has only
   been exercised by hand with `make drift`, `make bias` and `make broken`.
-- **Tests marked `slow` do not run in CI**, so FR-5, NFR-8 (ROC-AUC, Brier) and
-  NFR-10 are checked only by `make test` (BACKLOG P4 #1).
 - **`tests/unit/test_dag.py` skips wherever Airflow is not installed**, CI
   included. The DAG's coverage is therefore not part of the 80% gate.
 - **The splits are ID ranges, not periods.** The file has no dates, so batch 5

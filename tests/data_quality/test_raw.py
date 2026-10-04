@@ -248,6 +248,32 @@ class TestIngestion:
         assert load_raw_metadata(dest)["n_rows"] == len(synthetic_raw_df)
         assert list(tmp_path.glob("*.tmp")) == []
 
+    def test_another_downloads_temporary_files_are_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        """Two downloads into one directory (a manual run beside the DAG) must
+        not write through, rename or delete each other's half-written files."""
+        dest = tmp_path / "raw.parquet"
+        theirs = {
+            tmp_path / "raw.parquet.tmp": b"another run's parquet, half written",
+            tmp_path / "raw.meta.json.tmp": b"another run's sidecar",
+        }
+        for path, content in theirs.items():
+            path.write_bytes(content)
+        self._counting_fetch(monkeypatch, synthetic_raw_df)
+
+        download_raw(dest=dest)
+
+        for path, content in theirs.items():
+            assert path.read_bytes() == content, f"{path.name} was touched"
+        assert len(pd.read_parquet(dest)) == len(synthetic_raw_df)
+        assert sorted(p.name for p in tmp_path.glob("*.tmp")) == sorted(p.name for p in theirs)
+        # Unique temporaries are created 0600; the files they become must not be.
+        plain = tmp_path / "plain"
+        plain.write_bytes(b"")
+        for written in (dest, raw_meta_path(dest)):
+            assert written.stat().st_mode & 0o777 == plain.stat().st_mode & 0o777
+
     def test_download_writes_parquet_and_records_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
     ) -> None:

@@ -214,6 +214,23 @@ def _completed_download(target: Path) -> tuple[bool, str]:
     return True, "parquet matches its sidecar"
 
 
+def _unique_temporary(final: Path) -> Path:
+    """An empty file beside ``final`` that no other process can be using.
+
+    Fixed names (``raw.parquet.tmp``) let two downloads into one directory --
+    a manual run beside the DAG -- write through and rename each other's
+    files. mkstemp creates it 0600, so it is given the mode an ordinary file
+    created here would have; the renamed result must not be private to
+    whichever container wrote it.
+    """
+    handle, name = tempfile.mkstemp(dir=final.parent, prefix=f"{final.name}.", suffix=".tmp")
+    os.close(handle)
+    mask = os.umask(0)
+    os.umask(mask)
+    os.chmod(name, 0o666 & ~mask)
+    return Path(name)
+
+
 def _write_download(frame: pd.DataFrame, metadata: dict[str, Any], target: Path) -> None:
     """Write the parquet and its sidecar so that no crash leaves an orphan parquet.
 
@@ -223,17 +240,20 @@ def _write_download(frame: pd.DataFrame, metadata: dict[str, Any], target: Path)
     disk (old, or absent) does not match, which the next run re-downloads.
     """
     meta_path = raw_meta_path(target)
-    tmp_parquet = target.with_name(target.name + ".tmp")
-    tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
+    temporaries: list[Path] = []
     try:
+        tmp_parquet = _unique_temporary(target)
+        temporaries.append(tmp_parquet)
+        tmp_meta = _unique_temporary(meta_path)
+        temporaries.append(tmp_meta)
         frame.to_parquet(tmp_parquet, index=False)
         sidecar = {**metadata, "parquet_sha256": _file_sha256(tmp_parquet)}
         tmp_meta.write_text(json.dumps(sidecar, indent=2) + "\n")
         os.replace(tmp_meta, meta_path)
         os.replace(tmp_parquet, target)
     finally:
-        tmp_parquet.unlink(missing_ok=True)
-        tmp_meta.unlink(missing_ok=True)
+        for leftover in temporaries:
+            leftover.unlink(missing_ok=True)
 
 
 def download_raw(dest: Path | None = None, force: bool = False) -> Path:

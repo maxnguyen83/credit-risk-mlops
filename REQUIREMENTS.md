@@ -79,8 +79,8 @@ not installed, CI included. Alert names refer to `monitoring/prometheus/alerts/`
 
 | ID | Requirement | Pri | Where | Verified by |
 |---|---|---|---|---|
-| FR-19 | Alert when the live selection-rate gap between protected groups exceeds 0.05 for 15 minutes. Groups below the sample floor are not published. | P1 | `FairnessGapExceeded` · `fairness.yml` | `tests/unit/test_metrics.py::test_a_group_below_the_sample_floor_is_not_published` (CI `test`); rule loading in CI `smoke (compose)`; firing exercised by hand with `make bias` |
-| FR-20 | Publish PSI per feature against the training baseline and alert above 0.25 for 20 minutes; alert when the high-risk share moves more than 10 points from the registration baseline for 15 minutes. | P1 | `FeatureDriftHigh`, `HighRiskShareShift` · `model.yml` | `tests/unit/test_metrics.py::test_psi_flags_a_clearly_shifted_distribution`, `::test_observe_features_publishes_psi_against_the_baseline`, `::test_baseline_high_risk_share_is_published_and_replaced` (CI `test`); firing exercised by hand with `make drift` |
+| FR-19 | Alert when the live selection-rate gap between protected groups exceeds 0.05 for 15 minutes. Groups below the sample floor are not published. | P1 | `FairnessGapExceeded` · `fairness.yml` | `tests/unit/test_metrics.py::test_a_group_below_the_sample_floor_is_not_published` (CI `test`); `monitoring/prometheus/tests/rules_test.yml`: pending at 10 min and firing at 17 min on a 0.06 gap, silent on a 0.03 gap; `monitoring/alertmanager/tests/test_config.sh`: routed to the `warning` receiver (both CI `alert rules`); rule loading in CI `smoke (compose)`. `make bias` does not make it fire |
+| FR-20 | Publish PSI per feature against the training baseline and alert above 0.25 for 20 minutes; alert when the high-risk share moves more than 10 points from the registration baseline for 15 minutes. | P1 | `FeatureDriftHigh`, `HighRiskShareShift` · `model.yml` | `tests/unit/test_metrics.py::test_psi_flags_a_clearly_shifted_distribution`, `::test_observe_features_publishes_psi_against_the_baseline`, `::test_baseline_high_risk_share_is_published_and_replaced` (CI `test`); `HighRiskShareShift` in `monitoring/prometheus/tests/rules_test.yml`: fires on a 0.30 share against a 0.124 baseline, silent on an idle API and with no baseline installed (CI `alert rules`). `FeatureDriftHigh` has no firing test; `make drift` takes it to pending only, its `for: 20m` outlasting the 300 s run |
 | FR-21 | Provision the Prometheus datasource and three dashboards from files, with no manual setup. | P2 | `monitoring/grafana/provisioning/` | No automated check |
 
 ---
@@ -128,9 +128,15 @@ Stated here so that nobody reads a requirement above as met when it is not.
   alerts on that; nothing recomputes the threshold until the next training run.
 - **NFR-4 has an instrument but no recorded result.** `scripts/load_test.py`
   exists; nobody has yet published a run against the compose stack.
-- **Alert rules are checked for loading, not for firing.** CI confirms
-  Prometheus loaded every rule. That each one fires on its condition has only
-  been exercised by hand with `make drift`, `make bias` and `make broken`.
+- **Three of the nine alert rules have a firing test.** CI's `alert rules` job
+  runs `promtool test rules` on `monitoring/prometheus/tests/rules_test.yml`,
+  which checks that `FairnessGapExceeded`, `HighRiskShareShift` and
+  `ModelNotLoaded` fire on synthetic series that should trip them and stay
+  silent on series that should not. `ApiDown`, `HighErrorRate`,
+  `SlowPredictions`, `SlowBatchPredictions`, `SlowExplanations` and
+  `FeatureDriftHigh` are checked only for loading (CI `smoke (compose)`); by
+  hand, `make broken` fires `HighErrorRate` and `make drift` takes
+  `FeatureDriftHigh` to pending.
 - **`tests/unit/test_dag.py` skips wherever Airflow is not installed**, CI
   included. The DAG's coverage is therefore not part of the 80% gate.
 - **The splits are ID ranges, not periods.** The file has no dates, so batch 5

@@ -110,7 +110,7 @@ elif [[ "$SMOKE_ALLOW_DEGRADED" == "1" ]]; then
   warn "no model loaded; continuing because SMOKE_ALLOW_DEGRADED=1"
   warn "this is the exact state ModelNotLoaded alerts on"
 else
-  die "API is up but no model is loaded after ${SMOKE_WAIT_SECONDS}s (check MLflow and the Production stage)"
+  die "API is up but no model is loaded after ${SMOKE_WAIT_SECONDS}s (check MLflow: the champion alias, else the Production stage)"
 fi
 
 # ---------------------------------------------------------------- endpoints

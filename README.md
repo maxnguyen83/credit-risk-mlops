@@ -118,6 +118,18 @@ the DAG's `register_model` task (`python -m credit_risk.models.registry`).
 Ports are in the 1xxxx range on purpose — a machine that has been through this
 course already has four lab stacks holding 5000, 8080, 9090 and 3000.
 
+### Alert delivery
+
+Out of the box Alertmanager sends nothing: every receiver is a no-op, alerts
+are grouped and shown in its UI and in Grafana, and the stack needs no secret to
+start. Put a Telegram bot token and a chat id, as two files, in
+`monitoring/alertmanager/secrets/` (gitignored) and run
+`docker compose up -d alertmanager`, and the same routes deliver to that chat:
+critical alerts and pipeline failures within seconds, warnings silently and
+grouped per component. Anything incomplete falls back to the no-op config with a
+warning in the log. Step by step, including finding the chat id:
+[`docs/ALERTING.md`](docs/ALERTING.md).
+
 ---
 
 ## Try it

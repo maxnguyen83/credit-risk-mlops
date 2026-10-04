@@ -20,15 +20,17 @@ config and logs a `WARNING`; it never stops Alertmanager from starting.
 
 | Alert | Receiver | First message after | Repeats while firing | In Telegram |
 |---|---|---|---|---|
-| `PipelineTaskFailed` (posted by the Airflow DAG) | `pipeline` | 10 s, grouped per DAG | every 12 h, if it is still active | with sound; no "resolved" message |
+| `PipelineTaskFailed` (posted by the Airflow DAG) | `pipeline` | 10 s, grouped per DAG | every 12 h until a run succeeds | with sound; "resolved" when a later run succeeds |
 | `severity="critical"`: `ApiDown`, `ModelNotLoaded` | `critical` | 10 s | every 1 h | with sound; "resolved" when it clears |
 | `severity="warning"`: `HighErrorRate`, `Slow*Predictions`, `HighRiskShareShift`, `FeatureDriftHigh`, `FairnessGapExceeded` | `warning` | 2 min, grouped per component (serving, model, fairness) | every 4 h | silent; "resolved" when it clears |
 | `severity="info"` (`SlowExplanations`) and anything without a severity | `null` | — | — | never sent |
 
-`PipelineTaskFailed` gets no "resolved" message because a task failure is an
-event, not a state: the callback posts it once, and unless the post carries an
-end time Alertmanager times it out after `resolve_timeout` (5 minutes). A "RESOLVED" at that point would claim the
-pipeline had been fixed when nothing happened.
+`PipelineTaskFailed` is posted by the DAG's failure callback with an end time
+24 hours out, and resolved by its success callback when a later run succeeds,
+so a "RESOLVED" for it means the pipeline ran green again. The one case where
+that misleads: if no run happens within those 24 hours, the alert expires, and
+Alertmanager reports the expiry as resolved too. Check the DAG's last run in
+Airflow before reading a pipeline "RESOLVED" as a fix.
 
 Two inhibit rules keep a cause from arriving with its symptoms: `ApiDown`
 suppresses every warning and info alert, and `ModelNotLoaded` suppresses
@@ -137,7 +139,7 @@ times out. If nothing arrives:
 
 ```bash
 docker compose logs alertmanager | grep -i -e warning -e telegram
-curl -s http://127.0.0.1:19093/metrics | grep 'alertmanager_notifications_failed_total{integration="telegram"}'
+curl -s http://127.0.0.1:19093/metrics | grep 'alertmanager_notifications_failed_total{integration="telegram"'
 ```
 
 `Unauthorized` means a wrong token; `chat not found` means a wrong chat id, or a
@@ -187,3 +189,13 @@ docker run --rm --entrypoint /bin/sh \
 They load both configs, compare their routing, check which receiver a pipeline
 failure, a critical, a warning and an info alert reach, and run the entrypoint
 against complete, partial and malformed secrets.
+
+Then restart, so the running Alertmanager picks the change up:
+
+```bash
+docker compose restart alertmanager
+```
+
+A reload (`POST /-/reload`, or SIGHUP) is not enough while Telegram is on: it
+re-reads the copy in `/tmp` that the entrypoint filled in at start, not the
+files you edited. A restart runs the entrypoint again.

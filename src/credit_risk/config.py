@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     max_batch_size: int = 1000
     risk_share_window: int = 200  # rolling window for the share gauges
 
+    # --- batch scoring -------------------------------------------------
+    # Where `credit_risk.scoring.batch` sends its requests: the published port
+    # on a laptop; the compose service name (http://credit-api:8000) inside
+    # the Airflow container. Read from CREDIT_API_URL.
+    credit_api_url: str = "http://localhost:18000"
+
     # --- intervention capacity --------------------------------------
     # The risk team can act on 10% of the portfolio per month. Every
     # business metric (recall@k, lift@k, expected loss) is defined against

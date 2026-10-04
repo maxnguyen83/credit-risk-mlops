@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from credit_risk import schema
@@ -451,3 +452,53 @@ def test_raw_and_clean_rejections_share_one_tolerance(
 
     with pytest.raises(DataValidationError, match="8.0%"):
         build_splits(raw, tmp_path)
+
+
+def test_a_quarantined_null_does_not_turn_an_integer_column_into_floats(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """One null makes pandas hold the whole column as float64. Dropping the
+    row does not undo that, so every split would carry floats, change hash and
+    hand serving a different dtype than the published file produces."""
+    raw = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+    reference = build_splits(raw.copy(), tmp_path / "reference")
+    raw[schema.BILL_COLS[0]] = raw[schema.BILL_COLS[0]].astype("float64")
+    raw.loc[11, schema.BILL_COLS[0]] = float("nan")
+
+    manifest = build_splits(raw, tmp_path / "built")
+
+    assert manifest["quarantine"]["by_check"] == {"no_nulls": 1}
+    for name in SPLIT_FILES:
+        built = load_split(name, tmp_path / "built")
+        expected = load_split(name, tmp_path / "reference")
+        assert dict(built.dtypes) == dict(expected.dtypes), name
+    # Only the batch that lost the row changes; every other split is identical.
+    assert manifest["splits"]["test"]["sha256"] == reference["splits"]["test"]["sha256"]
+
+
+def test_the_quarantine_file_has_one_schema_whether_or_not_it_holds_rows(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """A consumer reading quarantine.parquet must not see the columns reorder
+    or change type depending on what this run happened to set aside."""
+    clean_raw = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+    with_ages, _ = _full_raw_with(make_raw_frame, schema.AGE, 150, n_bad=10)
+    with_null = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+    with_null[schema.AGE] = with_null[schema.AGE].astype("float64")
+    with_null.loc[5, schema.AGE] = float("nan")
+    with_code, _ = _full_raw_with(make_raw_frame, schema.EDUCATION, 7, n_bad=5)
+
+    schemas = []
+    for label, frame in [
+        ("empty", clean_raw),
+        ("ages", with_ages),
+        ("null", with_null),
+        ("code", with_code),
+    ]:
+        build_splits(frame, tmp_path / label)
+        schemas.append(pq.read_schema(tmp_path / label / QUARANTINE_FILE))
+
+    first = schemas[0]
+    assert first.names == [*schema.RAW_COLUMNS, BATCH_COL, QUARANTINE_REASON_COL]
+    for other in schemas[1:]:
+        assert other.equals(first, check_metadata=False), f"{other} != {first}"

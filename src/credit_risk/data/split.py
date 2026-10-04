@@ -41,6 +41,7 @@ from typing import Any, Final
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_float_dtype
 
 from credit_risk import schema
 from credit_risk.config import settings
@@ -62,7 +63,10 @@ log = logging.getLogger(__name__)
 # consumer looks for its name.
 __all__ = [
     "BATCH_COL",
+    "CLEAN_CHECK_PREFIX",
+    "INTEGER_COLUMNS",
     "MANIFEST_NAME",
+    "QUARANTINE_COLUMNS",
     "QUARANTINE_FILE",
     "QUARANTINE_REASON_COL",
     "SPLIT_BATCHES",
@@ -90,6 +94,17 @@ QUARANTINE_FILE: Final = "quarantine.parquet"
 # "clean:education_codes" (the same code, still invalid after folding) differ.
 QUARANTINE_REASON_COL: Final = "quarantine_reason"
 CLEAN_CHECK_PREFIX: Final = "clean:"
+# The one column layout of quarantine.parquet, whether or not it holds rows.
+QUARANTINE_COLUMNS: Final[tuple[str, ...]] = (
+    *schema.RAW_COLUMNS,
+    BATCH_COL,
+    QUARANTINE_REASON_COL,
+)
+
+# Every column of the published file is an integer (measured: 30,000 x 25,
+# all int64). A single null makes pandas hold its whole column as float64, and
+# quarantining that row does not undo it -- so the type is restored afterwards.
+INTEGER_COLUMNS: Final[tuple[str, ...]] = schema.RAW_COLUMNS
 
 SPLIT_FILES: Final[dict[str, str]] = {
     "train": "train.parquet",
@@ -196,7 +211,25 @@ def quarantine_rows(
     bad = (batched[QUARANTINE_REASON_COL] != "").to_numpy()
     quarantined = batched.loc[bad].reset_index(drop=True)
     kept = batched.loc[~bad].drop(columns=QUARANTINE_REASON_COL).reset_index(drop=True)
-    return kept, quarantined
+    return _restore_integers(kept), quarantined
+
+
+def _restore_integers(frame: pd.DataFrame) -> pd.DataFrame:
+    """Cast the integer columns that a removed null left as float64 back to int64.
+
+    Only when every remaining value is a whole number: a column that really
+    holds fractions is left alone and logged, never truncated.
+    """
+    out = frame.copy()
+    for column in INTEGER_COLUMNS:
+        if column not in out.columns or not is_float_dtype(out[column]):
+            continue
+        values = out[column].to_numpy(dtype="float64")
+        if not (np.isfinite(values).all() and (values == np.round(values)).all()):
+            log.warning("%s holds non-integer values; leaving it as float64", column)
+            continue
+        out[column] = values.astype("int64")
+    return out
 
 
 def _reject_cleaned(
@@ -224,9 +257,19 @@ def _reject_cleaned(
     )
 
 
-def _empty_quarantine() -> pd.DataFrame:
-    columns = [*schema.RAW_COLUMNS, BATCH_COL, QUARANTINE_REASON_COL]
-    return pd.DataFrame({column: pd.Series(dtype="object") for column in columns})
+def _quarantine_frame(quarantined: pd.DataFrame | None) -> pd.DataFrame:
+    """The rows to write to quarantine.parquet, in its one fixed schema.
+
+    Raw values as float64 -- a quarantined row may hold a null, and the
+    published integers convert exactly -- the batch as int64 and the reasons as
+    strings, in :data:`QUARANTINE_COLUMNS` order. An empty quarantine gets the
+    same schema as a full one, so a reader never sees it change shape.
+    """
+    source = pd.DataFrame(columns=list(QUARANTINE_COLUMNS)) if quarantined is None else quarantined
+    out = pd.DataFrame({column: source[column].astype("float64") for column in schema.RAW_COLUMNS})
+    out[BATCH_COL] = source[BATCH_COL].astype("int64")
+    out[QUARANTINE_REASON_COL] = source[QUARANTINE_REASON_COL].astype("string")
+    return out.reset_index(drop=True)
 
 
 def _quarantine_counts(quarantined: pd.DataFrame) -> dict[str, int]:
@@ -256,8 +299,9 @@ def write_splits(
     change?" can be told apart from the files alone.
 
     ``quarantined`` holds the rows :func:`build_splits` set aside. They are
-    written to :data:`QUARANTINE_FILE` and counted in the manifest; ``None``
-    writes an empty quarantine, so the file always describes this run.
+    written to :data:`QUARANTINE_FILE` in one fixed schema and counted in the
+    manifest; ``None`` writes an empty quarantine, so the file always
+    describes this run.
 
     An empty split raises unless ``allow_empty_splits`` is set. It is reachable
     without one: ``assign_batches`` clips at :data:`schema.N_BATCHES`, so a
@@ -270,7 +314,7 @@ def write_splits(
 
     frames = split_frames(df)
     provenance = dict(source or {})
-    held = _empty_quarantine() if quarantined is None else quarantined
+    held = _quarantine_frame(quarantined)
     manifest: dict[str, Any] = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         # Rows received: the ones split below plus the ones set aside.

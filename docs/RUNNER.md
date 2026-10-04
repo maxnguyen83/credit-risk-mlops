@@ -55,6 +55,20 @@ health of every container.
   On a machine that has never run the stack this file is optional: the job falls
   back to `.env.example`, as CI does. To keep it elsewhere, add
   `DEPLOY_ENV_FILE=/absolute/path` to the runner's `.env` file.
+- **Optional: alert delivery.** Without Telegram secrets the deployed stack
+  starts and sends no alerts. To have it deliver, keep the two files outside
+  the runner's checkout and point the deploy's `.env` at them:
+
+  ```bash
+  mkdir -p ~/.config/credit-risk/alertmanager
+  # telegram_bot_token and telegram_chat_id go here: docs/ALERTING.md, steps 1-3
+  echo "ALERTMANAGER_SECRETS_DIR=$HOME/.config/credit-risk/alertmanager" \
+    >> ~/.config/credit-risk/deploy.env
+  ```
+
+  The next deploy picks them up. Changing the chat id later needs
+  `docker compose restart alertmanager` in the runner's checkout, since a
+  deploy that changes nothing in the service definition leaves it running.
 - **One runner directory per repository.** A runner registration belongs to a
   single repository. If this machine already has a runner for another one (for
   example `~/actions-runner` from Lab 5), leave it alone and use a new directory.

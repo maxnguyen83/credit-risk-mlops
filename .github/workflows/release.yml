@@ -1,0 +1,105 @@
+name: Release
+
+# Tag -> image on GHCR -> GitHub Release.
+#
+# Separate from ci.yml on purpose: CI answers "is this commit sound", release
+# answers "is this artefact published". Merging them means every push to main
+# tries to authenticate against a registry it has no business touching.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write # creating the Release
+  packages: write # pushing to ghcr.io
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    name: build, push and release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Full history so the release notes can be generated from the commits
+          # since the previous tag rather than from a single shallow commit.
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The built-in token. No PAT to rotate, no secret to leak, and the
+          # permission is scoped to this repository by the block above.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Lowercased by the action: GHCR rejects an uppercase path, and GitHub
+          # usernames are not lowercase.
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/credit-risk-api
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=Credit Default Early-Warning API
+            org.opencontainers.image.description=DDM501 final project — FastAPI serving with SHAP/LIME and fairness monitoring
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create the GitHub Release
+        # gh rather than a third-party action: it ships on the runner, it needs
+        # no extra token, and there is one less dependency to audit.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          {
+            echo "### Container image"
+            echo
+            echo '```'
+            echo "docker pull ${REGISTRY}/${GITHUB_REPOSITORY}/credit-risk-api:${TAG#v}"
+            echo '```'
+            echo
+            # The model card is the artefact a reviewer actually wants attached
+            # to a credit-scoring release: intended use, measured performance,
+            # fairness results and the stated limits.
+            if [[ -f MODEL_CARD.md ]]; then
+              echo "The model card for this release is attached as \`MODEL_CARD.md\`."
+              echo
+            fi
+          } > "$notes_file"
+
+          args=(--title "$TAG" --notes-file "$notes_file" --generate-notes)
+          # if-blocks, not `[[ -f x ]] && args+=(...)`: under `set -e` a false
+          # test is the last command of the line and kills the whole step.
+          if [[ -f MODEL_CARD.md ]]; then args+=(MODEL_CARD.md); fi
+          if [[ -f DATASHEET.md ]]; then args+=(DATASHEET.md); fi
+
+          gh release create "$TAG" "${args[@]}"

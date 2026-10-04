@@ -87,7 +87,7 @@ flowchart TB
     MLF --> PG
     MLF --> MIO
     AF -->|"register ONLY if perf gate AND fairness gate pass"| MLF
-    API -->|"models:/credit-risk/Production resolved at startup"| MLF
+    API -->|"models:/credit-risk@champion resolved at startup, Production stage as fallback"| MLF
     MIO -.->|"artifact fetched directly via boto3"| API
     CLIENT -->|HTTP| API
     PROM -->|"scrape /metrics · 5s"| API
@@ -425,10 +425,13 @@ magnitude slower.
 `ubuntu-latest`, with a matrix over Python 3.11 and 3.12. `deploy.yml` runs on a
 self-hosted runner labelled `credit-risk`, installed on the machine that runs the
 compose stack. It starts only when CI succeeds on a push to `main`, deploys the
-exact commit CI tested, trains and registers a model only if nothing is in
-Production, restarts the API, and fails unless the API serves the version the
-registry holds in Production (`scripts/verify_deploy.py`). Registering the
-runner is [`docs/RUNNER.md`](docs/RUNNER.md).
+exact commit CI tested, trains and registers a model only if the registry
+serves nothing (no version carries the `champion` alias and none is in
+Production), restarts the API, and fails unless the version the alias names
+(the Production stage's when no version carries it), the version `/health`
+reports and the version that scored `docs/examples/high_risk.json` are the
+same, and `/version` reports the deployed commit (`scripts/verify_deploy.py`).
+Registering the runner is [`docs/RUNNER.md`](docs/RUNNER.md).
 
 **Rejected.** Everything on the self-hosted runner, as in Labs 4 and 5.
 Everything on hosted runners, deploying into the host over SSH or a tunnel. And
@@ -566,7 +569,7 @@ project's argument.
 | Fairness | dp at most 0.05, eo at most 0.08 | `evaluate_and_gate` blocks registration |
 | Served capacity | the API flags 10% ± 1 point of accounts the cut-off was not computed on | `tests/integration/test_serving_threshold.py` in the `test` job (synthetic pool); `tests/model/test_served_capacity.py` in `data_quality` (real `serving_pool`) |
 | Runtime health | a model is loaded and serving | container `HEALTHCHECK` and `scripts/smoke.sh` |
-| Deployment | the API serves the version the registry holds in Production, and scores a sample account | `scripts/verify_deploy.py` in `deploy.yml` |
+| Deployment | the API serves the version the `champion` alias names (the Production stage's when no version carries it), scores a sample account with it, and reports the deployed commit | `scripts/verify_deploy.py` in `deploy.yml` |
 
 ---
 
@@ -579,6 +582,6 @@ Stated explicitly, because the honest answer to *does this architecture scale* i
 |---|---|---|
 | 300k accounts, hourly scoring | `SequentialExecutor` | Airflow with Celery or Kubernetes executor |
 | Many concurrent explanations | SHAP and LIME sharing the serving process | Extract `explain/` into its own service — the package boundary exists, but `serving/routes.py` and the explainers call each other directly and would need an HTTP interface (see D1) |
-| Several models, several teams | A single registry stage per model | Model namespacing and a per-model promotion policy |
+| Several models, several teams | A single `champion` alias per model | Model namespacing and a per-model promotion policy |
 | A genuinely regulated deployment | SQLite metadata, anonymous Grafana | Managed Postgres, SSO, audit logging, a secret manager |
 | A real streaming requirement | Batch ingestion | Kafka and an online feature store — the point at which D2 and D5 would be revisited |

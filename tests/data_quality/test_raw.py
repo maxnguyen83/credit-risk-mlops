@@ -16,6 +16,7 @@ import ast
 import hashlib
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 from typing import Final
@@ -181,31 +182,71 @@ class TestIngestion:
         assert calls == [schema.DATASET_URL]
         assert len(pd.read_parquet(dest)) == len(synthetic_raw_df)
 
-    def test_a_crash_mid_download_never_leaves_a_parquet_without_a_sidecar(
+    @staticmethod
+    def _second_rename_dies(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Let the first os.replace through and kill the process on the second."""
+        real = os.replace
+        calls: list[str] = []
+
+        def replace(src: object, dst: object) -> None:
+            calls.append(str(dst))
+            if len(calls) == 2:
+                raise KeyboardInterrupt("killed between the two renames")
+            real(src, dst)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(download_module.os, "replace", replace)
+
+    @staticmethod
+    def _counting_fetch(monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame) -> list[str]:
+        calls: list[str] = []
+
+        def fetch(url: str) -> bytes:
+            calls.append(url)
+            return f"zip-{len(calls)}".encode()
+
+        monkeypatch.setattr(download_module, "_fetch", fetch)
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: frame)
+        return calls
+
+    def test_a_crash_between_the_two_renames_is_downloaded_again(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
     ) -> None:
-        """Whatever fails part way through, the next run must not find a
-        parquet it would trust without knowing where it came from."""
-
-        class Crash(RuntimeError):
-            pass
-
-        class ClockThatDies:
-            @staticmethod
-            def now(tz: object = None) -> object:
-                raise Crash("killed between the two writes")
-
-        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
-        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
-        monkeypatch.setattr(download_module, "datetime", ClockThatDies)
         dest = tmp_path / "raw.parquet"
+        calls = self._counting_fetch(monkeypatch, synthetic_raw_df)
+        with monkeypatch.context() as crash:
+            self._second_rename_dies(crash)
+            with pytest.raises(KeyboardInterrupt):
+                download_raw(dest=dest)
 
-        with pytest.raises(Crash):
-            download_raw(dest=dest)
+        download_raw(dest=dest)
 
-        assert not dest.exists() or raw_meta_path(dest).exists()
-        leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
-        assert leftovers == []
+        assert len(calls) == 2, "the half-finished download was trusted"
+        assert load_raw_metadata(dest)["parquet_sha256"] == _sha256(dest)
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_a_crash_while_replacing_an_old_download_is_downloaded_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        """The case the rename order exists for. The sidecar on disk predates the
+        parquet digest, so it is trusted on its archive hash alone. Rename the
+        new parquet first, die, and that old sidecar vouches for a file it never
+        described. Rename the new sidecar first, die, and its digest disowns the
+        old parquet left in place."""
+        dest = tmp_path / "raw.parquet"
+        synthetic_raw_df.head(50).to_parquet(dest, index=False)
+        raw_meta_path(dest).write_text(json.dumps({"sha256": "0" * 64, "n_rows": 50}) + "\n")
+        calls = self._counting_fetch(monkeypatch, synthetic_raw_df)
+        with monkeypatch.context() as crash:
+            self._second_rename_dies(crash)
+            with pytest.raises(KeyboardInterrupt):
+                download_raw(dest=dest, force=True)
+
+        download_raw(dest=dest)
+
+        assert len(calls) == 2, "a sidecar vouched for a parquet it does not describe"
+        assert len(pd.read_parquet(dest)) == len(synthetic_raw_df)
+        assert load_raw_metadata(dest)["n_rows"] == len(synthetic_raw_df)
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_download_writes_parquet_and_records_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
@@ -264,6 +305,10 @@ class TestIngestion:
 
         assert download_module.main(["--dest", str(dest)]) == 0
         assert capsys.readouterr().out.strip() == str(dest)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class _Response:

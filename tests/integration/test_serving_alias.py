@@ -31,13 +31,16 @@ from tests.integration.test_api import build_stub_model, payload
 FAIR_ENOUGH = {"demographic_parity_difference": 0.01, "equalized_odds_difference": 0.02}
 
 
-def stub_resolution(monkeypatch: pytest.MonkeyPatch, resolved_by: str, uri: str) -> None:
+def stub_resolution(
+    monkeypatch: pytest.MonkeyPatch, resolved_by: str, uri: str, *errors: str
+) -> None:
     metadata = registry.VersionMetadata(
         model_name=settings.model_name,
         version="3",
         run_id="run-3",
         resolved_by=resolved_by,
         resolved_uri=uri,
+        resolution_errors=errors,
     )
     monkeypatch.setattr(registry, "production_version_metadata", lambda **kwargs: metadata)
     monkeypatch.setattr(registry, "load_production_model", lambda **kwargs: object())
@@ -71,6 +74,27 @@ def test_a_stage_fallback_is_logged_with_the_command_that_ends_it(
         model_loader.ModelHolder().load()
 
     assert "set-champion --version 3" in caplog.text
+
+
+def test_a_fallback_forced_by_an_unreadable_alias_is_a_warning_with_the_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Not "no alias yet" -- the alias lookup failed. Serving stays up on the
+    # stage, and the log says what failed rather than suggesting set-champion.
+    stub_resolution(
+        monkeypatch,
+        "stage",
+        f"models:/{settings.model_name}/Production",
+        "could not read credit-risk@champion: 503 Service Unavailable",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=model_loader.log.name):
+        holder = model_loader.ModelHolder()
+        assert holder.load() is True
+
+    assert holder.model_ref == "stage"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("503 Service Unavailable" in r.getMessage() for r in warnings)
 
 
 def test_nothing_loaded_means_no_reference(monkeypatch: pytest.MonkeyPatch) -> None:

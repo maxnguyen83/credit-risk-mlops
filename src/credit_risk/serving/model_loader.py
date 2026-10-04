@@ -225,9 +225,11 @@ class ModelHolder:
                 loaded = load_production_model(model_uri=metadata.model_uri)
                 ref = _model_ref(metadata.resolved_by)
                 ref_uri = metadata.resolved_uri or UNKNOWN
+                lookup_errors = tuple(metadata.resolution_errors)
             else:
                 loaded = load_production_model()
                 ref, ref_uri = "stage", settings.model_uri
+                lookup_errors = ()
             info: Any = None
             if isinstance(loaded, tuple) and loaded:
                 model = loaded[0]
@@ -279,7 +281,18 @@ class ModelHolder:
             threshold.value,
             threshold.source,
         )
-        if ref == "stage":
+        if ref == "stage" and lookup_errors:
+            # Not "no alias yet": the alias could not be read. The stage keeps
+            # the service up, and may not be the version the alias names.
+            log.warning(
+                "serving version %s from %s because the %r alias could not be read (%s). "
+                "Check the registry and restart the API",
+                version,
+                ref_uri,
+                settings.model_alias,
+                "; ".join(lookup_errors),
+            )
+        elif ref == "stage":
             log.warning(
                 "serving version %s from %s because no version carries the %r alias. "
                 "Set it with `python -m credit_risk.models.registry set-champion "

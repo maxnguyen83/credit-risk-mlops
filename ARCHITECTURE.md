@@ -297,11 +297,23 @@ registry, whose version 2 was promoted before the alias was used
 
 Promotion is a decision, not a side effect of training. `register_model`
 promotes a candidate that passed the gates only when there is no champion, or
-when its held-out PR-AUC — logged on the same split, which each run records by
-hash — is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005, about half the
-cross-validation spread) below the champion's. Any other candidate is
-registered as the `challenger` (stage Staging) with a tag saying why, and a
-person promotes it with `set-champion` or leaves it.
+when its held-out PR-AUC is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005,
+about half the cross-validation spread) below the champion's. Any other
+candidate is registered as the `challenger` (stage Staging) with a tag saying
+why, and a person promotes it with `set-champion` or leaves it. Once the alias
+exists it alone decides what serves; moving a version to Production in the
+MLflow UI does not, which is why `set-champion` moves both.
+
+The comparison has limits, and they are deliberate. Each run records the
+held-out split's hash, and a candidate scored on a different split is never
+promoted automatically — but only when both runs carry the hash. Version 2's
+run predates it, so the first comparison against version 2 trusts the logged
+PR-AUCs without that check (the split is deterministic, which is an argument,
+not a verification; the version's `promotion_reason` tag records it). A
+champion lookup that fails for any reason other than "not found" parks the
+candidate as the challenger instead of reading the registry as empty, and a
+promotion that cannot be written makes `register_model` exit 3, failing the DAG
+task with the registry's resulting state in the log.
 
 The decision threshold travels the same way. `register_model` tags each version
 with `threshold_at_k` (the capacity cut-off its evaluation computed),

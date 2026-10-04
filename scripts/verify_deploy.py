@@ -76,8 +76,9 @@ LATEST_VERSIONS_PATH: Final = "/api/2.0/mlflow/registered-models/get-latest-vers
 ALIAS_PATH: Final = "/api/2.0/mlflow/registered-models/alias"
 # What MLflow answers when no version carries the alias, or the model itself
 # does not exist: 400 INVALID_PARAMETER_VALUE ("Registered model alias champion
-# not found."). A 404 means the same to us -- either that, or a server that
-# predates aliases -- and the stage lookup that follows settles it.
+# not found.") on 2.19, or RESOURCE_DOES_NOT_EXIST. Only these, carried in
+# MLflow's own JSON error body, mean "no alias"; a 404 without them -- a proxy,
+# a wrong URL, a server that predates aliases -- is a failure, not a fallback.
 NO_ALIAS_ERRORS: Final = ("INVALID_PARAMETER_VALUE", "RESOURCE_DOES_NOT_EXIST")
 POLL_SECONDS: Final = 2.0
 
@@ -424,8 +425,10 @@ def fetch_alias_version(
     if status == 200:
         payload = body if isinstance(body, Mapping) else None
         return pick_alias_version(payload, model_name=model_name, alias=alias)
-    if status == 404 or (
-        status == 400 and isinstance(body, Mapping) and body.get("error_code") in NO_ALIAS_ERRORS
+    if (
+        status in (400, 404)
+        and isinstance(body, Mapping)
+        and body.get("error_code") in NO_ALIAS_ERRORS
     ):
         return None
     raise ServiceError(_describe_error(status, body))

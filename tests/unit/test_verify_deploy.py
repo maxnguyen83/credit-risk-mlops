@@ -283,6 +283,33 @@ def test_settings_resolve_flag_then_environment_then_env_file_then_default() -> 
 # ------------------------------------------------- CLI against a stub stack
 
 
+def _alias_route(alias: str = "champion") -> tuple[str, str]:
+    return ("GET", vd.alias_query("credit-risk", alias))
+
+
+def _alias_payload(version: str, stage: str = "Production") -> dict[str, Any]:
+    return {
+        "model_version": {
+            "name": "credit-risk",
+            "version": version,
+            "current_stage": stage,
+            "run_id": f"run{version}abcdef0123",
+            "aliases": ["champion"],
+        }
+    }
+
+
+# What MLflow 2.19 answers when no version carries the alias -- measured
+# against the live registry, whose version 2 predates aliases.
+NO_ALIAS = (
+    400,
+    {
+        "error_code": "INVALID_PARAMETER_VALUE",
+        "message": "Registered model alias champion not found.",
+    },
+)
+
+
 class _Stub:
     """MLflow and the API on one localhost port; each test sets the answers."""
 
@@ -318,6 +345,9 @@ def stub() -> Iterator[_Stub]:
         def log_message(self, *args: Any) -> None:
             pass
 
+    # By default nothing carries the alias, answered the way MLflow 2.19
+    # answers it -- not with the stub's generic 404, which is now an error.
+    state.routes[_alias_route()] = NO_ALIAS
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     state.url = f"http://127.0.0.1:{server.server_address[1]}"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -458,33 +488,6 @@ def test_cli_fails_cleanly_on_an_unreadable_sample(stub: _Stub, tmp_path: Path) 
 # ---------------------------------------------------- the champion alias
 
 
-def _alias_route(alias: str = "champion") -> tuple[str, str]:
-    return ("GET", vd.alias_query("credit-risk", alias))
-
-
-def _alias_payload(version: str, stage: str = "Production") -> dict[str, Any]:
-    return {
-        "model_version": {
-            "name": "credit-risk",
-            "version": version,
-            "current_stage": stage,
-            "run_id": f"run{version}abcdef0123",
-            "aliases": ["champion"],
-        }
-    }
-
-
-# What MLflow 2.19 answers when no version carries the alias -- measured
-# against the live registry, whose version 2 predates aliases.
-NO_ALIAS = (
-    400,
-    {
-        "error_code": "INVALID_PARAMETER_VALUE",
-        "message": "Registered model alias champion not found.",
-    },
-)
-
-
 def test_the_alias_decides_when_it_exists(
     stub: _Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -541,6 +544,25 @@ def test_cli_fails_when_the_api_still_serves_the_stage_version_after_an_alias_mo
     assert _run(stub, tmp_path=tmp_path) == vd.EXIT_FAILED
     out = capsys.readouterr().out
     assert "serves version 2 but @champion is version 3" in out
+
+
+def test_a_bare_404_from_the_alias_lookup_is_not_a_missing_alias(
+    stub: _Stub, tmp_path: Path
+) -> None:
+    # A proxy's 404 or a mistyped MLflow URL is not MLflow saying "no such
+    # alias"; falling back to the stage on it could approve the wrong version.
+    _consistent(stub, "3")
+    stub.routes[_alias_route()] = (404, {"code": "not_found"})
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_FAILED
+
+
+def test_mlflows_own_404_for_a_missing_model_means_no_alias(stub: _Stub, tmp_path: Path) -> None:
+    stub.routes[_alias_route()] = (
+        404,
+        {"error_code": "RESOURCE_DOES_NOT_EXIST", "message": "Registered Model not found"},
+    )
+    stub.routes[REGISTRY] = (200, {})
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_NO_VERSION
 
 
 def test_cli_passes_against_a_stack_serving_the_alias(stub: _Stub, tmp_path: Path) -> None:

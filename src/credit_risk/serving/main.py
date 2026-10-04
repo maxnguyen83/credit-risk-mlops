@@ -163,9 +163,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         prime_reference_data()
         log.info(
-            "serving %s version=%s algo=%s threshold=%.4f threshold_source=%s",
+            "serving %s version=%s model_ref=%s algo=%s threshold=%.4f threshold_source=%s",
             settings.model_name,
             model_loader.MODEL.version,
+            model_loader.MODEL.model_ref,
             model_loader.MODEL.algo,
             model_loader.MODEL.threshold,
             model_loader.MODEL.threshold_source,
@@ -308,6 +309,10 @@ async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
 def health() -> HealthResponse:
     """Report the served model, not merely that the port is open.
 
+    `model_ref` says whether that model was found through the champion alias or
+    through the stage fallback, so "I set the alias, is it live?" has an answer
+    here rather than in the logs.
+
     Returns 200 even when degraded, on purpose: a 503 here puts the container
     into a restart loop that destroys the very logs explaining the problem.
     `credit_model_loaded == 0` and the ModelNotLoaded alert are what wake
@@ -324,6 +329,8 @@ def health() -> HealthResponse:
         model_name=settings.model_name,
         model_version=holder.version,
         run_id=holder.run_id,
+        model_ref=holder.model_ref,
+        model_ref_uri=holder.model_ref_uri,
         algo=holder.algo,
         trained_at=holder.trained_at,
         api_version=settings.api_version,

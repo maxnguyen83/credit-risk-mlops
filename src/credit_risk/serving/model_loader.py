@@ -38,6 +38,12 @@ UNKNOWN: Final = "unknown"
 # and had no usable tag -- the case that must never look like the first one.
 ThresholdSource = Literal["registry", "env", "fallback"]
 
+# How the served version was found. `alias`: `models:/<name>@<MODEL_ALIAS>`, the
+# way promotion marks the champion. `stage`: `models:/<name>/<MODEL_STAGE>`,
+# the fallback for a registry populated before aliases were used. `unknown`:
+# nothing is loaded, or the registry did not say.
+ModelRef = Literal["alias", "stage", "unknown"]
+
 
 @dataclass(frozen=True)
 class DecisionThreshold:
@@ -131,6 +137,8 @@ class ModelHolder:
     algo: str = UNKNOWN
     trained_at: str = UNKNOWN
     run_id: str = UNKNOWN
+    model_ref: ModelRef = UNKNOWN
+    model_ref_uri: str = UNKNOWN
     decision: DecisionThreshold = field(default_factory=_no_model_threshold)
     last_error: str | None = None
 
@@ -156,6 +164,8 @@ class ModelHolder:
         trained_at: str = UNKNOWN,
         run_id: str = UNKNOWN,
         threshold: DecisionThreshold | None = None,
+        model_ref: ModelRef = UNKNOWN,
+        model_ref_uri: str = UNKNOWN,
     ) -> None:
         """Adopt an estimator directly. Used by the loader and by tests.
 
@@ -167,6 +177,8 @@ class ModelHolder:
         self.algo = algo
         self.trained_at = trained_at
         self.run_id = run_id
+        self.model_ref = model_ref
+        self.model_ref_uri = model_ref_uri
         self.decision = resolve_threshold(None) if threshold is None else threshold
         self.last_error = None
 
@@ -177,10 +189,16 @@ class ModelHolder:
         self.algo = UNKNOWN
         self.trained_at = UNKNOWN
         self.run_id = UNKNOWN
+        self.model_ref = UNKNOWN
+        self.model_ref_uri = UNKNOWN
         self.decision = _no_model_threshold()
 
     def load(self) -> bool:
-        """Pull the production model from the MLflow registry. Never raises.
+        """Pull the champion from the MLflow registry. Never raises.
+
+        The version is the one `models:/<name>@<MODEL_ALIAS>` names, or, when no
+        version carries the alias, the one in `MODEL_STAGE`; `model_ref` records
+        which. Read once, here: a promotion made later is served after a restart.
 
         A registry that is down or empty must leave the service running in a
         DEGRADED state rather than aborting the boot: a process that refuses to
@@ -198,14 +216,18 @@ class ModelHolder:
                 production_version_metadata,
             )
 
-            # The version first, then the model by that version's own URI, so
-            # the tags read below describe the estimator actually loaded even if
-            # somebody promotes another version in between.
+            # The version first -- by alias, else by stage -- then the model by
+            # that version's own URI, so the tags read below describe the
+            # estimator actually loaded even if somebody promotes another
+            # version in between.
             metadata = production_version_metadata()
             if metadata is not None:
                 loaded = load_production_model(model_uri=metadata.model_uri)
+                ref = _model_ref(metadata.resolved_by)
+                ref_uri = metadata.resolved_uri or UNKNOWN
             else:
                 loaded = load_production_model()
+                ref, ref_uri = "stage", settings.model_uri
             info: Any = None
             if isinstance(loaded, tuple) and loaded:
                 model = loaded[0]
@@ -213,7 +235,10 @@ class ModelHolder:
             else:
                 model = loaded
             if model is None:
-                raise RuntimeError("registry returned no model for the Production stage")
+                raise RuntimeError(
+                    f"registry returned no model for {settings.model_name}@"
+                    f"{settings.model_alias} or the {settings.model_stage} stage"
+                )
             if info is None:
                 info = metadata
             version, algo, trained_at = describe_version(info)
@@ -239,16 +264,31 @@ class ModelHolder:
             trained_at=trained_at,
             run_id=run_id,
             threshold=threshold,
+            model_ref=ref,
+            model_ref_uri=ref_uri,
         )
         log.info(
-            "model loaded version=%s algo=%s trained_at=%s run_id=%s threshold=%.4f source=%s",
+            "model loaded version=%s via %s (%s) algo=%s trained_at=%s run_id=%s "
+            "threshold=%.4f source=%s",
             version,
+            ref,
+            ref_uri,
             algo,
             trained_at,
             run_id,
             threshold.value,
             threshold.source,
         )
+        if ref == "stage":
+            log.warning(
+                "serving version %s from %s because no version carries the %r alias. "
+                "Set it with `python -m credit_risk.models.registry set-champion "
+                "--version %s` and restart the API",
+                version,
+                ref_uri,
+                settings.model_alias,
+                version,
+            )
         if threshold.source == "fallback":
             # Loud on purpose: the service works, and decides at a cutoff that
             # was typed into configuration rather than computed for this model.
@@ -261,6 +301,15 @@ class ModelHolder:
                 version,
             )
         return True
+
+
+def _model_ref(resolved_by: str | None) -> ModelRef:
+    """The registry's "alias"/"stage" as the closed set /health reports."""
+    if resolved_by == "alias":
+        return "alias"
+    if resolved_by == "stage":
+        return "stage"
+    return UNKNOWN
 
 
 # One holder per process. Callers reference `model_loader.MODEL` rather than

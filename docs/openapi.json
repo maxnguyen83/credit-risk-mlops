@@ -12,7 +12,7 @@
           "ops"
         ],
         "summary": "Health, plus which model is answering",
-        "description": "Report the served model, not merely that the port is open.\n\nReturns 200 even when degraded, on purpose: a 503 here puts the container\ninto a restart loop that destroys the very logs explaining the problem.\n`credit_model_loaded == 0` and the ModelNotLoaded alert are what wake\nsomeone up; this endpoint's job is to say why.\n\nIt also says which cutoff decisions are made at and where it came from.\n`threshold_source: \"fallback\"` is a working service deciding at a configured\nconstant because the loaded version carries no threshold tag.",
+        "description": "Report the served model, not merely that the port is open.\n\n`model_ref` says whether that model was found through the champion alias or\nthrough the stage fallback, so \"I set the alias, is it live?\" has an answer\nhere rather than in the logs.\n\nReturns 200 even when degraded, on purpose: a 503 here puts the container\ninto a restart loop that destroys the very logs explaining the problem.\n`credit_model_loaded == 0` and the ModelNotLoaded alert are what wake\nsomeone up; this endpoint's job is to say why.\n\nIt also says which cutoff decisions are made at and where it came from.\n`threshold_source: \"fallback\"` is a working service deciding at a configured\nconstant because the loaded version carries no threshold tag.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -1010,6 +1010,21 @@
             "title": "Run Id",
             "description": "The MLflow run the serving version was trained in."
           },
+          "model_ref": {
+            "type": "string",
+            "enum": [
+              "alias",
+              "stage",
+              "unknown"
+            ],
+            "title": "Model Ref",
+            "description": "How the serving version was found: 'alias' = models:/<name>@<MODEL_ALIAS> (the champion promotion sets); 'stage' = models:/<name>/<MODEL_STAGE>, the fallback when no version carries the alias; 'unknown' = no model is loaded."
+          },
+          "model_ref_uri": {
+            "type": "string",
+            "title": "Model Ref Uri",
+            "description": "The registry URI the version was resolved from, e.g. models:/x@champion."
+          },
           "algo": {
             "type": "string",
             "title": "Algo"
@@ -1065,6 +1080,8 @@
           "model_name",
           "model_version",
           "run_id",
+          "model_ref",
+          "model_ref_uri",
           "algo",
           "trained_at",
           "api_version",
@@ -1081,6 +1098,8 @@
             "api_version": "1.0.0",
             "model_loaded": true,
             "model_name": "credit-risk",
+            "model_ref": "stage",
+            "model_ref_uri": "models:/credit-risk/Production",
             "model_version": "2",
             "run_id": "3914189dcbc645808759fd94c2900e5f",
             "status": "ok",

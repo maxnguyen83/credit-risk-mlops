@@ -155,18 +155,22 @@ EXAMPLE_FAIRNESS_REPORT: Final[dict[str, Any]] = {
     "request_id": "abb82478fdce45ed98805075fe040e62",
 }
 
-# Captured like the others, except `run_id`, `threshold` and `threshold_source`,
-# which were added afterwards and show what this code reports for version 2:
-# its run id is the one the registry records, and version 2 was registered
-# before versions carried a threshold tag, so until the tag is filled in
-# (`python -m credit_risk.models.registry tag-threshold --version 2`) it decides
-# at the configured 0.5 and says so.
+# Captured like the others, except `run_id`, `model_ref`, `model_ref_uri`,
+# `threshold` and `threshold_source`, which were added afterwards and show what
+# this code reports for version 2: its run id is the one the registry records;
+# version 2 was promoted before the champion alias existed, so it is found
+# through the Production stage until `python -m credit_risk.models.registry
+# set-champion --version 2` sets the alias; and it was registered before
+# versions carried a threshold tag, so until the tag is filled in
+# (`... tag-threshold --version 2`) it decides at the configured 0.5 and says so.
 EXAMPLE_HEALTH: Final[dict[str, Any]] = {
     "status": "ok",
     "model_loaded": True,
     "model_name": "credit-risk",
     "model_version": "2",
     "run_id": "3914189dcbc645808759fd94c2900e5f",
+    "model_ref": "stage",
+    "model_ref_uri": "models:/credit-risk/Production",
     "algo": "LGBMClassifier",
     "trained_at": "unknown",
     "api_version": "1.0.0",
@@ -453,6 +457,17 @@ class HealthResponse(_ApiModel):
     model_name: str
     model_version: str
     run_id: str = Field(..., description="The MLflow run the serving version was trained in.")
+    model_ref: Literal["alias", "stage", "unknown"] = Field(
+        ...,
+        description=(
+            "How the serving version was found: 'alias' = models:/<name>@<MODEL_ALIAS> "
+            "(the champion promotion sets); 'stage' = models:/<name>/<MODEL_STAGE>, the "
+            "fallback when no version carries the alias; 'unknown' = no model is loaded."
+        ),
+    )
+    model_ref_uri: str = Field(
+        ..., description="The registry URI the version was resolved from, e.g. models:/x@champion."
+    )
     algo: str
     trained_at: str
     api_version: str

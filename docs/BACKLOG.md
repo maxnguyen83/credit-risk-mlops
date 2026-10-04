@@ -22,11 +22,7 @@ Owners are the four slices in [`CONTRIBUTING.md`](../CONTRIBUTING.md):
 
 | # | Task | Why it matters | Effort |
 |---|---|---|---|
-| 1 | **Compute `SEX × AGE_GROUP` in `summaries_for_attributes`** (about four lines). `MODEL_CARD.md` and `ETHICS.md` both state that intersectional fairness is reported; nothing currently crosses two attributes. | A documented claim the code does not implement. Either deliver it or delete the sentence — delivering is worth more, because a model can clear every single-attribute gate and still be badly skewed on an intersection. | 45 min |
 | 2 | **Explain why the interpretable baseline is the less fair model.** Logistic regression fails the fairness gate (`eo_diff` 0.1125) while LightGBM passes at 0.0725. Write the hypothesis into `MODEL_CARD.md`. | This is counter-intuitive and currently unexplained. It also undercuts the usual "simpler models are safer" argument, which somebody will raise. | 30 min |
-| 3 | **Fix the artefact name in `MODEL_CARD.md`.** It says the trade-off table is logged as `tradeoff_curve.json`; the file written is `fairness_tradeoff.csv`/`.png`. | A document that names a file which does not exist. | 10 min |
-| 4 | **Fix the invariance claim in `README.md`.** It says the test bounds the probability change at 0.02 under the group-aware policy. `tests/model/test_invariance.py` asserts exactly `0.0` on the unawareness path. | The code is stronger than the sentence describing it. | 5 min |
-| 5 | **Re-export `data/processed/group_thresholds.json`** through `save_group_thresholds` so the attribute name travels with the numbers. | The mounted file is the old flat `{"1":…,"2":…}` shape, which slips past the attribute-mismatch guard in `mitigation.py`. A marital-status policy could be applied to sex codes without anything complaining. | 5 min |
 
 ---
 
@@ -34,23 +30,13 @@ Owners are the four slices in [`CONTRIBUTING.md`](../CONTRIBUTING.md):
 
 | # | Task | Why it matters | Effort |
 |---|---|---|---|
-| 2 | **Add `.dockerignore`** — `.venv/`, `data/`, `mlruns/`, `.git/`, `.env`, `htmlcov/`, `__pycache__/`. Measure the build context before and after. | The context is currently about 1.1 GB. Every build ships it to the daemon. | 5 min |
-| 3 | **Add `json_schema_extra` examples** to `PredictResponse`, `ExplainResponse` and `FairnessReportResponse`; dump `app.openapi()` to a committed `docs/openapi.json`. | Only the request model has an example, so the generated docs show request shapes and empty response shapes. | 30 min |
 | 4 | **Draw the three missing flows in `ARCHITECTURE.md`**: the `/predict/batch` sequence, the degraded-start 503 branch, and the `./data:/app/data:ro` edge that `docker-compose.yml` already calls the weakest seam in the design. | The document names a weakness and then does not show it. | 90 min |
-| 5 | **Correct the services table in `ARCHITECTURE.md`**: the object store is `chrislusf/seaweedfs`, and `createbucket` builds from `Dockerfile.mlflow`. | Stale after the MinIO removal. | 10 min |
 
 ---
 
 ## P4 — monitoring and CI
 
-| # | Task | Why it matters | Effort |
-|---|---|---|---|
-| 1 | **Add a CI job running `pytest tests/model -m "not needs_data"`.** | Every model-quality assertion — the PR-AUC floor, ROC-AUC, Brier, monotonicity, protected-attribute invariance — is currently deselected by the `not slow` filter. The exclusion saves 6.8 seconds and means a model regression passes CI. | 20 min |
-| 2 | **Repoint the Grafana *High-risk share* panel thresholds.** They are hard-coded at `0.2212 ± 0.10` — the label prevalence — while the panel description says it reads against the baseline gauge. The measured baseline is 0.124, which sits 0.003 inside green. | The panel is one small shift away from showing green during a real drift event. | 10 min |
-| 3 | **Fix the demo table in `README.md`.** It says `FeatureDriftHigh` fires. The rule has `for: 20m` and `make drift` runs 300 s, so the reachable state is `pending` — which is what was measured. Same for `FairnessGapExceeded` at `for: 15m`. | Claims an alert fires when the scenario cannot make it fire. | 10 min |
-| 4 | **Update `ARCHITECTURE.md` §5.** The `HighRiskShareShift` row describes a rule that no longer exists in that form; `SlowBatchPredictions` is missing (8 listed, 9 exist); `credit_baseline_high_risk_share` is missing (9 metrics listed, 10 exist). | The observability section no longer matches the observability. | 15 min |
-| 5 | **Add `pip-audit` as a CI job and a `.github/dependabot.yml`** for `pip` and `github-actions`. | 18 pinned runtime dependencies and nothing watching them for advisories. | 20 min |
-| 6 | **Fix the ADR citation in the `ci.yml` header** — it cites ADR 0007 (LightGBM) for a decision recorded in ADR 0008 (GitHub-hosted runners). | One word, but it reads as a comment nobody checked. | 2 min |
+Nothing open: all six items are under *Done*.
 
 ---
 
@@ -70,3 +56,45 @@ trained on; the download retries transient failures and exits 75 so Airflow
 retries the task; the raw parquet is trusted only with a sidecar that describes
 it; `validate_raw` keeps its report in XCom when it fails; a failed run posts
 `PipelineTaskFailed` to Alertmanager.
+
+Model and fairness (P2): `summaries_for_attributes` reports `SEX × AGE_GROUP` as
+one joint attribute, `SEX_x_AGE_GROUP` (`INTERSECTIONS` in `fairness/metrics.py`;
+`tests/unit/test_fairness.py::test_sex_by_age_group_is_reported_as_one_joint_attribute`,
+and the run's `by_SEX_x_AGE_GROUP_*` metrics in
+`tests/model/test_performance.py::test_train_all_logs_both_families_and_registers_through_the_gate`)
+(was P2 #1). `MODEL_CARD.md` names the trade-off artefacts `models/train.py`
+logs, `fairness_tradeoff.csv` and `fairness_tradeoff.png` (was P2 #3).
+`README.md` states the invariance bound as exactly 0.0 on the mitigated path,
+which is what
+`tests/model/test_invariance.py::test_flipping_sex_cannot_move_the_mitigated_probability_at_all`
+asserts (was P2 #4). `data/processed/group_thresholds.json` carries
+`"attribute": "SEX"` beside the thresholds, the shape `save_group_thresholds`
+(`fairness/mitigation.py`) writes; the file is git-ignored, so this was checked
+on the main checkout on 2026-10-04. A flat file still loads without the
+attribute check (`tests/unit/test_fairness.py::test_a_flat_thresholds_file_still_loads`)
+(was P2 #5).
+
+Serving (P3): `.dockerignore` excludes every path the item listed, plus the
+Alertmanager secrets; the context size after it was not recorded (was P3 #2).
+`PredictResponse`, `ExplainResponse`, `FairnessReportResponse` and
+`HealthResponse` carry `json_schema_extra` examples (`serving/models.py`), and
+`make openapi` writes the committed `docs/openapi.json`
+(`tests/integration/test_api.py::test_openapi_publishes_a_response_example_for_each_documented_answer`,
+`::test_the_committed_openapi_document_matches_the_app`) (was P3 #3). The
+services table in `ARCHITECTURE.md` lists `chrislusf/seaweedfs` and
+`createbucket` built from `Dockerfile.mlflow` (was P3 #5).
+
+Monitoring and CI (P4): the `model` job in `ci.yml` runs
+`pytest tests/model -m "not needs_data"` (was P4 #1). In
+`monitoring/grafana/dashboards/model-behaviour.json` the *High-risk share* stat
+is uncoloured, and *Distance from this model's own baseline* colours
+`abs(credit_high_risk_share - credit_baseline_high_risk_share)` at 0.05 and
+0.10, as `HighRiskShareShift` does; no threshold sits at 0.2212 any more (was
+P4 #2). The demo table in `README.md` shows `FeatureDriftHigh` as **pending**
+and `FairnessGapExceeded` as not firing, each with its `for:` (was P4 #3).
+`ARCHITECTURE.md` §5 lists the 10 metrics in `serving/metrics.py` and the 9
+rules in `monitoring/prometheus/alerts/`, `HighRiskShareShift` measured against
+`credit_baseline_high_risk_share` (was P4 #4). The `dependency audit` job runs
+`pip-audit -r requirements.txt`, report-only, and `.github/dependabot.yml`
+opens weekly PRs for `pip` and `github-actions` (was P4 #5). The `ci.yml`
+header cites `docs/adr/0008` (was P4 #6).

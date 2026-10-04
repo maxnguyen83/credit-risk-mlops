@@ -18,17 +18,24 @@ Triggered when CI succeeds on a push to `main`, or by hand from `main`:
    model artifact, are never removed;
 3. waits for Postgres, the object store, MLflow and Airflow to report healthy;
 4. downloads and splits the dataset if `data/processed/` is empty;
-5. if nothing is in Production, runs the pipeline once (`airflow dags test`,
-   the same as `make dag-test`); otherwise trains nothing;
-6. restarts `credit-api` so it loads the current Production model, and waits
-   for every service;
-7. runs `scripts/verify_deploy.py`: the version MLflow holds in Production, the
-   version `/health` reports and the version that scored
-   `docs/examples/high_risk.json` must all be the same, and `/version` must
-   report the deployed commit.
+5. if the registry serves nothing yet -- no version carries the `champion`
+   alias and none is in Production -- runs the pipeline once (`airflow dags
+   test`, the same as `make dag-test`), which promotes the first model that
+   passes the gates; otherwise trains nothing;
+6. restarts `credit-api` so it loads the current champion, and waits for every
+   service;
+7. runs `scripts/verify_deploy.py`: the version the `champion` alias names (the
+   Production stage when no version carries it), the version `/health` reports
+   and the version that scored `docs/examples/high_risk.json` must all be the
+   same, and `/version` must report the deployed commit.
 
-The job summary shows the commit, the model version and stage served, and the
-health of every container.
+The job summary shows the commit, the model version served, whether the alias
+or the stage named it, and the health of every container.
+
+A deploy never replaces a champion with a newly trained model. A retrain is the
+DAG's job; its register step promotes a candidate only if it is no worse than
+the champion beyond `PROMOTION_PR_AUC_TOLERANCE`, and otherwise registers it as
+the `challenger` for someone to review.
 
 ## Before you start
 
@@ -142,6 +149,31 @@ Check what is live at any time, from the repository root on the host:
 python3 scripts/verify_deploy.py              # registry vs API, plus one prediction
 ./scripts/stack_health.sh table               # every container's state and health
 ```
+
+## Changing the model that serves
+
+The API loads the champion once, at startup, so changing the model is three
+steps: promote, restart, verify. From the repository root on the host:
+
+```bash
+# 1. promote: a reviewed challenger, a rollback, or a version promoted before
+#    the alias existed. Idempotent; --dry-run prints what it would change.
+.venv/bin/python -m credit_risk.models.registry set-champion --version <N>
+
+# 2. restart the API so it resolves the alias again -- or deploy, which restarts
+#    and verifies in one go
+docker compose restart credit-api        # or: gh workflow run deploy.yml --ref main
+
+# 3. verify: registry, /health and a live prediction agree
+python3 scripts/verify_deploy.py
+```
+
+`/health` then reports `"model_ref": "alias"` and the new `model_version`. If it
+reports `"stage"`, no version carries the alias yet: run step 1 with the version
+it serves. A version registered before versions carried their decision
+threshold also needs `.venv/bin/python -m credit_risk.models.registry
+tag-threshold --version <N>` before the restart, or `/health` reports
+`"threshold_source": "fallback"`.
 
 ## Living with the runner
 

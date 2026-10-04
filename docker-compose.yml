@@ -159,6 +159,8 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME}
       MODEL_STAGE: ${MODEL_STAGE}
+      # Served first; MODEL_STAGE is the fallback. Defaulted for an older .env.
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
       THRESHOLD_POLICY: ${THRESHOLD_POLICY}
       # Defaulted, so an .env written before this variable existed still boots.
       THRESHOLD_SOURCE: ${THRESHOLD_SOURCE:-registry}
@@ -203,6 +205,10 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME}
+      # register_model compares with the version this alias names and promotes
+      # within this PR-AUC tolerance of it. Defaulted for an older .env.
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      PROMOTION_PR_AUC_TOLERANCE: ${PROMOTION_PR_AUC_TOLERANCE:-0.005}
       # Written onto every model version register_model creates (git_sha tag).
       GIT_SHA: ${GIT_SHA:-unknown}
     user: "${AIRFLOW_UID:-50000}:0"

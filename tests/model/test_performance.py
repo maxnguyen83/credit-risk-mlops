@@ -611,7 +611,8 @@ def test_resolve_tracking_uri_keeps_a_server_that_answers_its_health_check(monke
 
 def test_train_all_falls_back_to_the_written_splits_when_given_no_frames(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "credit_risk.models.train.load_training_splits", lambda: synthetic_split(n=1500)
+        "credit_risk.models.train.load_training_splits",
+        lambda processed_dir=None: synthetic_split(n=1500),
     )
 
     result = train_all(

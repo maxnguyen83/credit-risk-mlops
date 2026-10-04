@@ -46,7 +46,13 @@ from sklearn.preprocessing import StandardScaler
 
 from credit_risk import schema
 from credit_risk.config import PROJECT_ROOT, settings
-from credit_risk.data.split import BATCH_COL, assign_batches, load_split
+from credit_risk.data.split import (
+    BATCH_COL,
+    MANIFEST_NAME,
+    assign_batches,
+    frame_sha256,
+    load_split,
+)
 from credit_risk.fairness.metrics import (
     calibration_error_by_group,
     fairness_summary,
@@ -87,6 +93,33 @@ LIGHTGBM_GRID: dict[str, list[Any]] = {
 
 CV_FOLDS = 5
 
+# Run params naming the data a run saw. The two split hashes are computed from
+# the frames the run actually trained and scored on, with the same function
+# the split step used to write the manifest, so the two can be compared
+# directly. `registry` reads TEST_SHA_PARAM back to refuse comparing PR-AUCs
+# measured on different held-out rows.
+TRAIN_SHA_PARAM: Final = "data_train_sha256"
+TEST_SHA_PARAM: Final = "data_test_sha256"
+# The raw download's digest, copied from the manifest -- only when the manifest
+# describes these frames, since otherwise it is the origin of other rows.
+SOURCE_SHA_PARAM: Final = "data_source_sha256"
+# matched | mismatch | absent | unreadable: whether the manifest on disk
+# describes the frames this run used.
+MANIFEST_PARAM: Final = "data_manifest"
+MANIFEST_GENERATED_PARAM: Final = "data_manifest_generated_at"
+# The run keeps its own copy of the manifest here. The file in data/processed
+# is rewritten by every clean_and_split; the artifact is not.
+MANIFEST_ARTIFACT_DIR: Final = "data"
+
+
+@dataclass(frozen=True)
+class DataLineage:
+    """The params that name a run's data, and the manifest to keep with it."""
+
+    params: dict[str, str]
+    # Set only when the manifest's split hashes equal this run's frames.
+    manifest_path: Path | None = None
+
 
 @dataclass(frozen=True)
 class CandidateResult:
@@ -117,6 +150,7 @@ class TrainingResult:
     tracking_uri: str
     used_fallback_store: bool
     tradeoff: pd.DataFrame
+    lineage: dict[str, str] = field(default_factory=dict)
 
     @property
     def run_id(self) -> str | None:
@@ -210,6 +244,49 @@ def feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """
     built = build_features(frame)
     return built[list(FEATURE_NAMES)]
+
+
+def data_lineage(
+    train_df: pd.DataFrame, test_df: pd.DataFrame, processed_dir: Path | None = None
+) -> DataLineage:
+    """Name the data a run trains and scores on, from the frames themselves.
+
+    The hashes come from the frames, not from the manifest, because a caller
+    may hand train_all frames that never touched data/processed -- the DAG's
+    in-memory path, the tests -- and the manifest on disk would then describe
+    somebody else's rows. The manifest is adopted (its source digest copied,
+    the file kept as an artifact) only when its train and test hashes equal the
+    frames'. Never raises: lineage that cannot be established is recorded as
+    such, and the training run goes ahead.
+    """
+    train_sha, test_sha = frame_sha256(train_df), frame_sha256(test_df)
+    params = {
+        TRAIN_SHA_PARAM: train_sha,
+        TEST_SHA_PARAM: test_sha,
+        SOURCE_SHA_PARAM: "unknown",
+        MANIFEST_PARAM: "absent",
+    }
+    path = (settings.processed_dir if processed_dir is None else processed_dir) / MANIFEST_NAME
+    if not path.is_file():
+        return DataLineage(params)
+    try:
+        manifest = json.loads(path.read_text())
+        splits = manifest["splits"]
+        recorded = (splits["train"]["sha256"], splits["test"]["sha256"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("cannot read %s (%s); lineage records the frame hashes only", path, exc)
+        return DataLineage({**params, MANIFEST_PARAM: "unreadable"})
+
+    if recorded != (train_sha, test_sha):
+        logger.warning(
+            "%s describes other splits than the frames being trained on; not adopting it", path
+        )
+        return DataLineage({**params, MANIFEST_PARAM: "mismatch"})
+
+    params[MANIFEST_PARAM] = "matched"
+    params[SOURCE_SHA_PARAM] = str(manifest.get("source_sha256") or "unknown")
+    params[MANIFEST_GENERATED_PARAM] = str(manifest.get("generated_at") or "unknown")
+    return DataLineage(params, manifest_path=path)
 
 
 # ---------------------------------------------------------------- mlflow
@@ -481,6 +558,7 @@ def train_all(
     log_to_mlflow: bool = True,
     protected: str = schema.PRIMARY_PROTECTED,
     thresholds_path: Path | None = None,
+    processed_dir: Path | None = None,
 ) -> TrainingResult:
     """Train both families, log both runs, return the better one.
 
@@ -488,12 +566,22 @@ def train_all(
     here but is not part of the ranking, because a model can be the strongest
     candidate and still be unregisterable -- and hiding that behind a combined
     score would lose the finding.
+
+    `processed_dir` is where the splits and their manifest are read from;
+    the default is the configured data/processed.
     """
     capacity = (
         settings.intervention_capacity_fraction if capacity_fraction is None else capacity_fraction
     )
     if train_df is None or test_df is None:
-        train_df, test_df = load_training_splits()
+        train_df, test_df = load_training_splits(processed_dir)
+    lineage = data_lineage(train_df, test_df, processed_dir)
+    logger.info(
+        "data: train %s, test %s, manifest %s",
+        lineage.params[TRAIN_SHA_PARAM][:12],
+        lineage.params[TEST_SHA_PARAM][:12],
+        lineage.params[MANIFEST_PARAM],
+    )
 
     X_train, X_test = feature_frame(train_df), feature_frame(test_df)
     y_train = train_df[schema.TARGET].to_numpy(dtype=int)
@@ -598,6 +686,7 @@ def train_all(
                 proba=proba,
                 decisions=decisions,
                 sensitive_test=s_test,
+                lineage=lineage,
             )
         candidates.append(
             CandidateResult(
@@ -641,6 +730,7 @@ def train_all(
         tracking_uri=uri,
         used_fallback_store=used_fallback,
         tradeoff=tradeoff,
+        lineage=dict(lineage.params),
     )
 
 
@@ -664,10 +754,17 @@ def _log_run(
     proba: np.ndarray,
     decisions: np.ndarray,
     sensitive_test: np.ndarray,
+    lineage: DataLineage | None = None,
 ) -> str:
     """One MLflow run: params, metrics, artifacts, and the model itself."""
     with mlflow.start_run(run_name=name) as run:
         mlflow.log_params(params)
+        if lineage is not None:
+            # Params, not tags: they describe the run's inputs and, like the
+            # hyperparameters, can never change once logged.
+            mlflow.log_params(lineage.params)
+            if lineage.manifest_path is not None:
+                mlflow.log_artifact(str(lineage.manifest_path), MANIFEST_ARTIFACT_DIR)
         mlflow.log_metrics(
             {
                 "cv_pr_auc_mean": cv_mean,
@@ -771,6 +868,7 @@ def save_training_result(result: TrainingResult, path: Path | None = None) -> Pa
         "gate_passed": result.best.gate_passed,
         "gate_reasons": result.best.gate_reasons,
         "group_thresholds": result.best.group_thresholds,
+        "data_lineage": result.lineage,
         "candidates": [
             {
                 "name": c.name,

@@ -315,7 +315,45 @@ def test_a_context_with_nothing_useful_in_it_never_breaks_the_callback(
     dag_module.notify_failure({"dag_run": Broken()})
 
     labels = [json.loads(r.data)[0]["labels"] for r in posted.requests]
-    assert [label["task_id"] for label in labels] == ["unknown", "unknown"]
+    assert [label["task_id"] for label in labels] == ["dagrun", "dagrun"]
+
+
+def test_a_run_that_failed_without_a_failed_task_is_reported_as_the_run(
+    dag_module: ModuleType, posted: _Posted
+) -> None:
+    """dagrun_timeout fails the run and skips what was running, so no task is
+    `failed`. The context's `ti` is then just the run's last task instance --
+    possibly one that succeeded -- and must not be named as the culprit."""
+    context = {
+        "dag_run": _DagRun([]),
+        "ti": _FailedTask("build_features"),  # succeeded; Airflow hands it over anyway
+        "reason": "timed_out",
+    }
+
+    dag_module.notify_failure(context)
+
+    [alert] = posted.alerts()
+    assert alert["labels"]["task_id"] == "dagrun"
+    assert "timed_out" in alert["annotations"]["summary"]
+    assert "build_features" not in json.dumps(alert)
+
+
+@pytest.mark.parametrize(
+    ("failed", "claims_no_model"),
+    [("evaluate_and_gate", True), ("register_model", False), ("publish_report", False)],
+)
+def test_the_alert_says_no_model_was_registered_only_when_that_is_true(
+    pipeline: DAG, dag_module: ModuleType, posted: _Posted, failed: str, claims_no_model: bool
+) -> None:
+    """publish_report runs after register_model; when it fails, a new model
+    may well have been registered."""
+    dag_module.notify_failure({"dag_run": _DagRun([failed]), "dag": pipeline})
+
+    [alert] = posted.alerts()
+    description = alert["annotations"]["description"]
+    assert ("no new model" in description) is claims_no_model
+    if failed == "publish_report":
+        assert "did not run" not in description
 
 
 def test_a_successful_run_resolves_the_failure_alerts(
@@ -325,9 +363,14 @@ def test_a_successful_run_resolves_the_failure_alerts(
     after a re-run had already fixed the pipeline."""
     assert pipeline.on_success_callback.__name__ == "resolve_failure_alerts"
 
-    dag_module.resolve_failure_alerts({"dag": pipeline})
+    dag_module.resolve_failure_alerts({"dag": pipeline, "dag_run": _DagRun([])})
 
     alerts = posted.alerts()
-    assert {alert["labels"]["task_id"] for alert in alerts} == set(pipeline.task_ids)
+    assert {alert["labels"]["task_id"] for alert in alerts} == {*pipeline.task_ids, "dagrun"}
     assert all(alert["labels"]["alertname"] == "PipelineTaskFailed" for alert in alerts)
     assert all(alert["endsAt"] == alert["startsAt"] for alert in alerts)
+    # Alertmanager shows the annotations of the latest post, so a resolve with
+    # none renders as an empty RESOLVED message.
+    for alert in alerts:
+        assert alert["labels"]["task_id"] in alert["annotations"]["summary"]
+        assert "succeeded" in alert["annotations"]["description"]

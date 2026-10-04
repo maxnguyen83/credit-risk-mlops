@@ -91,8 +91,14 @@ FAILURE_ALERT_SEVERITY: Final = "critical"
 # after resolve_timeout (5m) and reports a broken pipeline as fixed. A day spans
 # the @daily schedule; a successful run resolves it sooner.
 FAILURE_ALERT_TTL: Final = timedelta(hours=24)
-# A callback that waits on a dead Alertmanager holds up the scheduler loop.
+# Airflow 2.8 runs DAG-level callbacks in the DAG file processor (in process
+# under `airflow dags test`), not in the scheduler loop. A post that waits on a
+# dead Alertmanager holds that processor up, so it gets a short timeout.
 ALERT_POST_TIMEOUT_SECONDS: Final = 5.0
+# The task_id label of an alert about the run rather than one task: a run can
+# fail with no failed task (dagrun_timeout skips whatever was still running).
+RUN_ALERT_TASK_ID: Final = "dagrun"
+REGISTER_TASK_ID: Final = "register_model"
 
 DEFAULT_ARGS: Final[dict[str, Any]] = {
     "owner": "p1-data",
@@ -257,36 +263,59 @@ def _post_alerts(alerts: list[dict[str, Any]]) -> bool:
 
 
 def _failed_task_instances(context: dict[str, Any]) -> list[Any]:
-    """The failed task instances of this run, best effort."""
+    """The failed task instances of this run, best effort; [] when there are none.
+
+    Never the context's own ``ti``: for a DAG-level callback that is simply the
+    run's last task instance, which may have succeeded.
+    """
     dag_run = context.get("dag_run")
-    if dag_run is not None:
-        try:
-            failed = list(dag_run.get_task_instances(state=["failed"]))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("could not list the failed tasks of the run: %s", exc)
-        else:
-            if failed:
-                return failed
-    ti = context.get("task_instance") or context.get("ti")
-    return [ti] if ti is not None else []
+    if dag_run is None:
+        return []
+    try:
+        return list(dag_run.get_task_instances(state=["failed"]))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list the failed tasks of the run: %s", exc)
+        return []
+
+
+def _consequence(dag: Any, task_id: str) -> str:
+    """What a failure of ``task_id`` stopped, read off the DAG's own edges.
+
+    Empty when the DAG is not in the context or the task has nothing after it
+    (publish_report runs after register_model, so a model may well have been
+    registered when it fails).
+    """
+    try:
+        downstream = set(dag.get_task(task_id).get_flat_relative_ids(upstream=False))
+    except Exception:  # noqa: BLE001 - no DAG in the context, or an unknown task
+        return ""
+    if not downstream:
+        return ""
+    skipped = ", ".join(sorted(downstream))
+    if REGISTER_TASK_ID in downstream:
+        return f"Downstream tasks did not run ({skipped}), so this run registered no new model. "
+    return f"Downstream tasks did not run ({skipped}). "
 
 
 def notify_failure(context: dict[str, Any]) -> None:
     """DAG on_failure_callback: one Alertmanager alert per failed task.
 
-    Runs where Airflow runs DAG callbacks -- the DAG processor under the
-    scheduler, in process under ``airflow dags test``. It must never raise:
-    a callback that throws loses the alert and buries the run's own failure
-    under a second traceback.
+    A run that failed without a failed task -- dagrun_timeout -- gets one alert
+    labelled task_id=dagrun with the reason Airflow gave. Runs where Airflow
+    runs DAG callbacks: the DAG file processor under the scheduler, in process
+    under ``airflow dags test``. It must never raise: a callback that throws
+    loses the alert and buries the run's own failure under a second traceback.
     """
     try:
         dag_run = context.get("dag_run")
+        dag = context.get("dag")
         dag_id = str(getattr(dag_run, "dag_id", None) or DAG_ID)
         run_id = str(getattr(dag_run, "run_id", None) or "unknown")
         reason = str(context.get("reason") or "task_failure")
         now = datetime.now(timezone.utc)  # noqa: UP017
+        timing = {"startsAt": _rfc3339(now), "endsAt": _rfc3339(now + FAILURE_ALERT_TTL)}
         alerts = []
-        for ti in _failed_task_instances(context) or [None]:
+        for ti in _failed_task_instances(context):
             task_id = str(getattr(ti, "task_id", None) or "unknown")
             log_url = str(getattr(ti, "log_url", None) or "")
             alerts.append(
@@ -296,15 +325,30 @@ def notify_failure(context: dict[str, Any]) -> None:
                         "summary": f"{dag_id}: task {task_id} failed",
                         "description": (
                             f"Task {task_id} failed in run {run_id} of {dag_id} ({reason}). "
-                            "Nothing downstream of it ran, so no new model was registered. "
-                            f"Log: {log_url or 'see the Airflow UI'}"
+                            + _consequence(dag, task_id)
+                            + f"Log: {log_url or 'see the Airflow UI'}"
                         ),
                         "run_id": run_id,
                         "log_url": log_url,
                     },
-                    "startsAt": _rfc3339(now),
-                    "endsAt": _rfc3339(now + FAILURE_ALERT_TTL),
+                    **timing,
                     "generatorURL": log_url,
+                }
+            )
+        if not alerts:
+            alerts.append(
+                {
+                    "labels": _alert_labels(dag_id, RUN_ALERT_TASK_ID),
+                    "annotations": {
+                        "summary": f"{dag_id}: run {run_id} failed ({reason})",
+                        "description": (
+                            f"Run {run_id} of {dag_id} failed ({reason}) with no failed task: "
+                            "a timeout skips whatever was still running. See the run in the "
+                            "Airflow UI for which tasks were skipped."
+                        ),
+                        "run_id": run_id,
+                    },
+                    **timing,
                 }
             )
         _post_alerts(alerts)
@@ -315,20 +359,32 @@ def notify_failure(context: dict[str, Any]) -> None:
 def resolve_failure_alerts(context: dict[str, Any]) -> None:
     """DAG on_success_callback: resolve any failure alert a previous run raised.
 
-    Posts every task's alert with endsAt = now. Alertmanager resolves the ones
-    that were firing and sends nothing for the ones that never were.
+    Posts every task's alert, and the run's, with endsAt = now. Alertmanager
+    resolves the ones that were firing and sends nothing for the ones that
+    never were. Each carries annotations, because Alertmanager shows the
+    latest post's: without them the RESOLVED notification would be blank.
     """
     try:
         dag = context.get("dag")
+        dag_run = context.get("dag_run")
         dag_id = str(getattr(dag, "dag_id", None) or DAG_ID)
+        run_id = str(getattr(dag_run, "run_id", None) or "unknown")
         task_ids = [str(task_id) for task_id in getattr(dag, "task_ids", [])]
         now = _rfc3339(datetime.now(timezone.utc))  # noqa: UP017
         alerts = [
-            {"labels": _alert_labels(dag_id, task_id), "startsAt": now, "endsAt": now}
-            for task_id in task_ids
+            {
+                "labels": _alert_labels(dag_id, task_id),
+                "annotations": {
+                    "summary": f"{dag_id}: {task_id} is no longer failing",
+                    "description": f"Run {run_id} of {dag_id} succeeded.",
+                    "run_id": run_id,
+                },
+                "startsAt": now,
+                "endsAt": now,
+            }
+            for task_id in [*task_ids, RUN_ALERT_TASK_ID]
         ]
-        if alerts:
-            _post_alerts(alerts)
+        _post_alerts(alerts)
     except Exception:  # noqa: BLE001
         log.exception("could not resolve the failure alerts")
 
@@ -357,9 +413,10 @@ def credit_risk_pipeline() -> None:
     def download_raw_task() -> str:
         """Fetch the UCI archive and land it as parquet. Idempotent by design.
 
-        The module retries a dropped connection or a 5xx itself, and exits
-        TRANSIENT_EXIT_CODE when the archive stays unreachable; that one exit
-        is retried by Airflow (DEFAULT_ARGS), every other failure is not.
+        The module retries a dropped connection, a timeout and HTTP 408, 425,
+        429, 500, 502, 503 and 504 itself, and exits TRANSIENT_EXIT_CODE when
+        the archive stays unreachable; that one exit is retried by Airflow
+        (DEFAULT_ARGS), every other failure is not.
         """
         return run_module(DOWNLOAD_MODULE).strip()
 

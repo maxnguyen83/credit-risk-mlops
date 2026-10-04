@@ -660,7 +660,7 @@ def test_main_exits_non_zero_when_the_winner_fails_the_fairness_gate(monkeypatch
         return TrainingResult(
             best=stub_candidate(gate_passed=kwargs["folds"] > 2),
             candidates=[stub_candidate(gate_passed=True)],
-            tracking_uri="file:///tmp/mlruns",
+            tracking_uri=(tmp_path / "mlruns").as_uri(),
             used_fallback_store=True,
             tradeoff=pd.DataFrame([{"strategy": "baseline", "pr_auc": 0.6}]),
         )
@@ -829,7 +829,7 @@ def _handoff(tmp_path, *, gate_passed: bool, run_id: str | None = "run-1") -> ob
             {
                 "run_id": run_id,
                 "model": "lightgbm",
-                "tracking_uri": "file:///tmp/mlruns",
+                "tracking_uri": (tmp_path / "mlruns").as_uri(),
                 "used_fallback_store": False,
                 "metrics": {
                     "pr_auc": 0.61 if gate_passed else 0.10,

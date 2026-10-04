@@ -244,6 +244,32 @@ def _tag_refusal(run_id: str, reasons: list[str], client: MlflowClient) -> None:
         logger.warning("could not tag run %s with the refusal: %s", run_id, exc)
 
 
+def record_refusal(
+    run_id: str | None, reasons: list[str], *, tracking_uri: str | None = None
+) -> None:
+    """Tag a refused run from a step that holds only the hand-off artefact.
+
+    In the DAG a refusal fails the task that finds it -- `evaluate_and_gate`,
+    or training itself when the winner breaches a fairness limit -- so
+    `register_model`, which tags through `register_if_passes`, never runs.
+    Each of those steps records its refusal here instead. Best effort, as
+    `_tag_refusal` is: a tag that cannot be written is logged and the refusal
+    stands.
+    """
+    if not run_id:
+        logger.warning(
+            "refused, but there is no run to tag (trained with --no-mlflow?): %s",
+            "; ".join(reasons),
+        )
+        return
+    try:
+        client = MlflowClient(tracking_uri=tracking_uri)
+    except StoreError as exc:
+        logger.warning("could not tag run %s with the refusal: %s", run_id, exc)
+        return
+    _tag_refusal(run_id, reasons, client)
+
+
 def evaluate_gate(metrics: dict[str, float], fairness_summary: dict[str, float]) -> list[str]:
     """Reasons this candidate must not be registered. Empty means it may be.
 

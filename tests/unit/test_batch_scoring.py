@@ -676,6 +676,28 @@ def test_max_reasons_bounds_the_explain_calls(data_dir: Path) -> None:
     assert summary["n_reasons_missing"] == 4
 
 
+def test_a_slow_explainer_stops_at_the_time_budget_and_the_list_is_still_published(
+    data_dir: Path,
+) -> None:
+    api = FakeApi()
+    run_dir = _scored_run(data_dir, _pool(30), api)
+    ticks = iter(range(100))  # one second per clock reading
+
+    summary = batch.publish_run(
+        run_dir,
+        _client(api),
+        data_dir=data_dir,
+        capacity_fraction=0.2,
+        explain_budget=1.5,
+        clock=lambda: float(next(ticks)),
+    )
+
+    assert len(api.explain_calls) == 1
+    assert summary["n_call_list"] == 6
+    assert summary["n_reasons_missing"] == 5
+    assert (data_dir / "scored" / "latest.json").exists()
+
+
 def test_a_failed_publish_leaves_the_previous_latest_untouched(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

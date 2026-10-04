@@ -99,6 +99,11 @@ SCORES_COLUMNS: Final[tuple[str, ...]] = (
 CALL_LIST_COLUMNS: Final[tuple[str, ...]] = (*SCORES_COLUMNS[:-1], "top_reasons")
 PROBABILITY_DECIMALS: Final = 4
 REASON_SEPARATOR: Final = " | "
+# Reasons are one /explain call per account, one after another. A slow
+# explainer must not hold the call list back until the task is killed: past
+# this budget the remaining accounts go without reasons and the list is
+# published anyway.
+EXPLAIN_BUDGET_SECONDS: Final = 600.0
 
 BATCH_PATH: Final = "/api/v1/predict/batch"
 EXPLAIN_PATH: Final = "/api/v1/explain"
@@ -521,6 +526,8 @@ def fetch_reasons(
     client: ApiClient,
     model_version: str,
     limit: int | None = None,
+    time_budget: float = EXPLAIN_BUDGET_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> list[str]:
     """``top_reasons`` per account, joined with " | "; "" where none could be had.
 
@@ -532,7 +539,15 @@ def fetch_reasons(
     """
     reasons = [""] * len(applications)
     budget = len(applications) if limit is None else min(limit, len(applications))
+    deadline = clock() + time_budget
     for position in range(budget):
+        if clock() >= deadline:
+            log.warning(
+                "explain time budget of %.0fs spent; the remaining %d account(s) go without reasons",
+                time_budget,
+                budget - position,
+            )
+            break
         try:
             body = client.explain(applications[position])
         except ApiUnavailableError as exc:
@@ -573,6 +588,8 @@ def publish_run(
     capacity_fraction: float | None = None,
     max_reasons: int | None = None,
     dag_run_id: str | None = None,
+    explain_budget: float = EXPLAIN_BUDGET_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Rank, explain the call list, write the outputs, then point latest.json at them.
 
@@ -608,6 +625,8 @@ def publish_run(
         client,
         str(scoring["model_version"]),
         limit=max_reasons,
+        time_budget=explain_budget,
+        clock=clock,
     )
     call_list["top_reasons"] = reasons
 

@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
@@ -75,6 +76,23 @@ TRANSIENT_EXIT_CODE: Final = 75
 
 # XCom key validate_raw pushes its report under, on success and on failure.
 VALIDATION_REPORT_XCOM_KEY: Final = "validation_report"
+
+DAG_ID: Final = "credit_risk_pipeline"
+
+# Failure alerts go straight to Alertmanager's v2 API, so a refused gate or a
+# dead task reaches the same receivers as every Prometheus alert. The URL is the
+# compose service name; set the variable to another URL to point elsewhere, or
+# to an empty string to switch the alerts off.
+ALERTS_URL_VARIABLE: Final = "ALERTMANAGER_ALERTS_URL"
+DEFAULT_ALERTS_URL: Final = "http://alertmanager:9093/api/v2/alerts"
+FAILURE_ALERT_NAME: Final = "PipelineTaskFailed"
+FAILURE_ALERT_SEVERITY: Final = "critical"
+# Posted once, so it needs an explicit end: without one Alertmanager resolves it
+# after resolve_timeout (5m) and reports a broken pipeline as fixed. A day spans
+# the @daily schedule; a successful run resolves it sooner.
+FAILURE_ALERT_TTL: Final = timedelta(hours=24)
+# A callback that waits on a dead Alertmanager holds up the scheduler loop.
+ALERT_POST_TIMEOUT_SECONDS: Final = 5.0
 
 DEFAULT_ARGS: Final[dict[str, Any]] = {
     "owner": "p1-data",
@@ -197,8 +215,126 @@ def run_module(module: str, *args: str, expect_output: bool = True) -> str:
     return completed.stdout
 
 
+def _alerts_url() -> str:
+    return os.environ.get(ALERTS_URL_VARIABLE, DEFAULT_ALERTS_URL).strip()
+
+
+def _rfc3339(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")  # noqa: UP017
+
+
+def _alert_labels(dag_id: str, task_id: str) -> dict[str, str]:
+    # The identity of an alert in Alertmanager. Nothing run-specific goes here,
+    # so a later success can resolve exactly the alert a failure raised.
+    return {
+        "alertname": FAILURE_ALERT_NAME,
+        "severity": FAILURE_ALERT_SEVERITY,
+        "dag_id": dag_id,
+        "task_id": task_id,
+    }
+
+
+def _post_alerts(alerts: list[dict[str, Any]]) -> bool:
+    """POST alerts to Alertmanager. Returns whether it accepted them; never raises."""
+    url = _alerts_url()
+    if not url:
+        log.info("%s is empty; not sending %d alert(s)", ALERTS_URL_VARIABLE, len(alerts))
+        return False
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(alerts).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=ALERT_POST_TIMEOUT_SECONDS) as response:  # noqa: S310
+            status = int(response.status)
+    except Exception as exc:  # noqa: BLE001 - an alert must never fail the thing it reports
+        log.warning("could not post %d alert(s) to %s: %s", len(alerts), url, exc)
+        return False
+    log.info("posted %d alert(s) to %s: HTTP %d", len(alerts), url, status)
+    return 200 <= status < 300
+
+
+def _failed_task_instances(context: dict[str, Any]) -> list[Any]:
+    """The failed task instances of this run, best effort."""
+    dag_run = context.get("dag_run")
+    if dag_run is not None:
+        try:
+            failed = list(dag_run.get_task_instances(state=["failed"]))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not list the failed tasks of the run: %s", exc)
+        else:
+            if failed:
+                return failed
+    ti = context.get("task_instance") or context.get("ti")
+    return [ti] if ti is not None else []
+
+
+def notify_failure(context: dict[str, Any]) -> None:
+    """DAG on_failure_callback: one Alertmanager alert per failed task.
+
+    Runs where Airflow runs DAG callbacks -- the DAG processor under the
+    scheduler, in process under ``airflow dags test``. It must never raise:
+    a callback that throws loses the alert and buries the run's own failure
+    under a second traceback.
+    """
+    try:
+        dag_run = context.get("dag_run")
+        dag_id = str(getattr(dag_run, "dag_id", None) or DAG_ID)
+        run_id = str(getattr(dag_run, "run_id", None) or "unknown")
+        reason = str(context.get("reason") or "task_failure")
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        alerts = []
+        for ti in _failed_task_instances(context) or [None]:
+            task_id = str(getattr(ti, "task_id", None) or "unknown")
+            log_url = str(getattr(ti, "log_url", None) or "")
+            alerts.append(
+                {
+                    "labels": _alert_labels(dag_id, task_id),
+                    "annotations": {
+                        "summary": f"{dag_id}: task {task_id} failed",
+                        "description": (
+                            f"Task {task_id} failed in run {run_id} of {dag_id} ({reason}). "
+                            "Nothing downstream of it ran, so no new model was registered. "
+                            f"Log: {log_url or 'see the Airflow UI'}"
+                        ),
+                        "run_id": run_id,
+                        "log_url": log_url,
+                    },
+                    "startsAt": _rfc3339(now),
+                    "endsAt": _rfc3339(now + FAILURE_ALERT_TTL),
+                    "generatorURL": log_url,
+                }
+            )
+        _post_alerts(alerts)
+    except Exception:  # noqa: BLE001
+        log.exception("could not build the failure alert; the run's own state is unaffected")
+
+
+def resolve_failure_alerts(context: dict[str, Any]) -> None:
+    """DAG on_success_callback: resolve any failure alert a previous run raised.
+
+    Posts every task's alert with endsAt = now. Alertmanager resolves the ones
+    that were firing and sends nothing for the ones that never were.
+    """
+    try:
+        dag = context.get("dag")
+        dag_id = str(getattr(dag, "dag_id", None) or DAG_ID)
+        task_ids = [str(task_id) for task_id in getattr(dag, "task_ids", [])]
+        now = _rfc3339(datetime.now(timezone.utc))  # noqa: UP017
+        alerts = [
+            {"labels": _alert_labels(dag_id, task_id), "startsAt": now, "endsAt": now}
+            for task_id in task_ids
+        ]
+        if alerts:
+            _post_alerts(alerts)
+    except Exception:  # noqa: BLE001
+        log.exception("could not resolve the failure alerts")
+
+
 @dag(
-    dag_id="credit_risk_pipeline",
+    dag_id=DAG_ID,
     description="UCI credit-default ingestion, training, fairness gate and registration",
     schedule="@daily",
     # timezone.utc rather than datetime.UTC: the project floor is Python
@@ -208,6 +344,8 @@ def run_module(module: str, *args: str, expect_output: bool = True) -> str:
     catchup=False,
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
+    on_failure_callback=notify_failure,
+    on_success_callback=resolve_failure_alerts,
     dagrun_timeout=timedelta(hours=2),
     tags=["ddm501", "credit-risk"],
     doc_md=__doc__,

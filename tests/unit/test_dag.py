@@ -186,3 +186,148 @@ def test_a_passing_validation_returns_and_pushes_the_same_report(
 
     assert returned == report
     assert ti.pushed == {dag_module.VALIDATION_REPORT_XCOM_KEY: report}
+
+
+# ---------------------------------------------------------- failure alerts
+
+
+class _FailedTask:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        self.log_url = f"http://localhost:8080/log?task_id={task_id}"
+        self.try_number = 1
+
+
+class _DagRun:
+    def __init__(self, failed: list[str]) -> None:
+        self.dag_id = DAG_ID
+        self.run_id = "scheduled__2026-10-04T00:00:00+00:00"
+        self._failed = [_FailedTask(task_id) for task_id in failed]
+
+    def get_task_instances(self, state: Any = None, **kwargs: Any) -> list[_FailedTask]:
+        return self._failed
+
+
+class _Posted:
+    """Captures what the callback sends instead of letting it reach a network."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def __call__(self, request: Any, timeout: float | None = None) -> Any:
+        self.requests.append(request)
+
+        class _Response:
+            status = 200
+
+            def __enter__(self) -> _Response:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+        return _Response()
+
+    def alerts(self) -> list[dict[str, Any]]:
+        assert len(self.requests) == 1, f"expected one POST, saw {len(self.requests)}"
+        return list(json.loads(self.requests[0].data))
+
+
+@pytest.fixture
+def posted(dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> _Posted:
+    capture = _Posted()
+    monkeypatch.setattr(dag_module.urllib.request, "urlopen", capture)
+    monkeypatch.delenv(dag_module.ALERTS_URL_VARIABLE, raising=False)
+    return capture
+
+
+def test_the_dag_alerts_when_a_run_fails(pipeline: DAG) -> None:
+    """Before this a refused gate or a failed task notified nobody."""
+    callback = pipeline.on_failure_callback
+    assert callback is not None and callback.__name__ == "notify_failure"
+
+
+def test_a_failed_run_posts_one_alert_per_failed_task(
+    dag_module: ModuleType, posted: _Posted
+) -> None:
+    context = {"dag_run": _DagRun(["evaluate_and_gate"]), "reason": "task_failure"}
+
+    dag_module.notify_failure(context)
+
+    request = posted.requests[0]
+    assert request.full_url == "http://alertmanager:9093/api/v2/alerts"
+    assert request.get_method() == "POST"
+    assert request.get_header("Content-type") == "application/json"
+    [alert] = posted.alerts()
+    assert alert["labels"] == {
+        "alertname": "PipelineTaskFailed",
+        "severity": "critical",
+        "dag_id": DAG_ID,
+        "task_id": "evaluate_and_gate",
+    }
+    assert "evaluate_and_gate" in alert["annotations"]["summary"]
+    assert "scheduled__2026-10-04" in alert["annotations"]["description"]
+    assert alert["generatorURL"].startswith("http://localhost:8080/log")
+    assert alert["startsAt"] < alert["endsAt"]
+
+
+def test_the_alertmanager_url_comes_from_the_environment(
+    dag_module: ModuleType, posted: _Posted, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(dag_module.ALERTS_URL_VARIABLE, "http://am.example.test/api/v2/alerts")
+
+    dag_module.notify_failure({"dag_run": _DagRun(["download_raw"])})
+
+    assert posted.requests[0].full_url == "http://am.example.test/api/v2/alerts"
+
+
+def test_an_empty_url_turns_alerting_off(
+    dag_module: ModuleType, posted: _Posted, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(dag_module.ALERTS_URL_VARIABLE, "")
+
+    dag_module.notify_failure({"dag_run": _DagRun(["download_raw"])})
+
+    assert posted.requests == []
+
+
+def test_an_unreachable_alertmanager_never_breaks_the_callback(
+    dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(request: Any, timeout: float | None = None) -> Any:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(dag_module.urllib.request, "urlopen", refused)
+
+    dag_module.notify_failure({"dag_run": _DagRun(["train_candidates"])})  # must not raise
+
+
+def test_a_context_with_nothing_useful_in_it_never_breaks_the_callback(
+    dag_module: ModuleType, posted: _Posted
+) -> None:
+    class Broken:
+        run_id = "manual__x"
+
+        def get_task_instances(self, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("metadata DB unavailable")
+
+    dag_module.notify_failure({})
+    dag_module.notify_failure({"dag_run": Broken()})
+
+    labels = [json.loads(r.data)[0]["labels"] for r in posted.requests]
+    assert [label["task_id"] for label in labels] == ["unknown", "unknown"]
+
+
+def test_a_successful_run_resolves_the_failure_alerts(
+    pipeline: DAG, dag_module: ModuleType, posted: _Posted
+) -> None:
+    """Without this a failure alert would stay firing for its whole lifetime
+    after a re-run had already fixed the pipeline."""
+    assert pipeline.on_success_callback.__name__ == "resolve_failure_alerts"
+
+    dag_module.resolve_failure_alerts({"dag": pipeline})
+
+    alerts = posted.alerts()
+    assert {alert["labels"]["task_id"] for alert in alerts} == set(pipeline.task_ids)
+    assert all(alert["labels"]["alertname"] == "PipelineTaskFailed" for alert in alerts)
+    assert all(alert["endsAt"] == alert["startsAt"] for alert in alerts)

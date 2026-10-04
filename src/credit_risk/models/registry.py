@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import mlflow
-import mlflow.pyfunc
+import mlflow.artifacts
 import mlflow.sklearn
 from mlflow.client import MlflowClient
 
@@ -1077,15 +1077,23 @@ def backfill_version_tags(
 def load_production_model(*, model_uri: str | None = None) -> Any | None:
     """Load the serving model, or return None with the reason logged.
 
-    The sklearn flavour, not pyfunc, and the distinction is not cosmetic. Pyfunc
-    hands back a `PyFuncModel` wrapper that exposes `predict` and nothing else:
-    no `predict_proba`, so a ranking service cannot rank, and no underlying tree
-    structure, so `shap.TreeExplainer` has nothing to read. Both failures appear
-    only at the first request, well after start-up has reported success.
+    The sklearn flavour, and only that flavour. Pyfunc hands back a
+    `PyFuncModel` wrapper that exposes `predict` and nothing else: no
+    `predict_proba`, so a ranking service cannot rank, and no underlying tree
+    structure, so `shap.TreeExplainer` has nothing to read.
 
-    Pyfunc remains the fallback, because a model logged under some other flavour
-    is still better served degraded than not at all -- and the caller finds out
-    from the attribute error rather than from silence.
+    There is no pyfunc fallback, on purpose. /predict, /predict/batch, /explain
+    and LIME all score through `predict_proba`, so a PyFuncModel would be
+    reported as loaded while every request failed, and ModelNotLoaded could
+    never fire. A version without a loadable scikit-learn flavour is refused
+    like a missing one. Training always logs through `mlflow.sklearn.log_model`,
+    so only a version registered by hand can lack it.
+
+    The artefacts are downloaded first and the flavour loaded from that copy,
+    so the log can say which of the two went wrong. MLflow raises the same
+    exception with the same code for a missing version as for a missing
+    flavour; here a failure while downloading is the store's (unreachable, no
+    such version, artifact store) and one after it is the version's own.
 
     Returning None rather than raising is what lets the API come up degraded:
     the container is reachable, `/health` says model_loaded=0, Prometheus fires
@@ -1094,17 +1102,19 @@ def load_production_model(*, model_uri: str | None = None) -> Any | None:
     """
     uri = settings.model_uri if model_uri is None else model_uri
     try:
-        return mlflow.sklearn.load_model(uri)
+        local = mlflow.artifacts.download_artifacts(artifact_uri=uri)
     except StoreError as exc:
         logger.warning("could not load %s: %s", uri, exc)
         return None
-    except Exception as exc:  # noqa: BLE001 - flavour mismatch, not a store failure
-        logger.warning("sklearn flavour unavailable for %s (%s); falling back to pyfunc", uri, exc)
-        try:
-            return mlflow.pyfunc.load_model(uri)
-        except Exception as fallback_exc:  # noqa: BLE001
-            logger.warning("could not load %s: %s", uri, fallback_exc)
-            return None
+    try:
+        return mlflow.sklearn.load_model(local)
+    except Exception as exc:  # noqa: BLE001 - the version itself, not the store
+        logger.warning(
+            "%s cannot be served without a loadable scikit-learn flavour (serving needs predict_proba): %s",
+            uri,
+            exc,
+        )
+        return None
 
 
 # ------------------------------------------------------------------- cli

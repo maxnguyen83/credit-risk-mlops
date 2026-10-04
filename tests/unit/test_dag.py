@@ -20,12 +20,17 @@ way to run it against the built image, without touching the running stack:
 
 from __future__ import annotations
 
+import importlib.util
+import subprocess
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
 pytest.importorskip("airflow", reason="Airflow is only installed in the Airflow image")
 
+from airflow.exceptions import AirflowException, AirflowFailException  # noqa: E402
 from airflow.models import DAG, DagBag  # noqa: E402 - must follow the skip
 
 DAGS_DIR = Path(__file__).resolve().parents[2] / "dags"
@@ -82,3 +87,61 @@ def test_catchup_is_off_so_unpausing_does_not_queue_a_backlog_of_runs(pipeline: 
     # training runs on the SequentialExecutor the moment the DAG is unpaused.
     assert pipeline.catchup is False
     assert pipeline.max_active_runs == 1
+
+
+# ------------------------------------------------------------ run_module
+
+
+@pytest.fixture(scope="module")
+def dag_module() -> ModuleType:
+    """The DAG file as a plain module, so its helpers can be called directly."""
+    spec = importlib.util.spec_from_file_location(
+        "credit_risk_pipeline_under_test", DAGS_DIR / "credit_risk_pipeline.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _exits(
+    monkeypatch: pytest.MonkeyPatch, module: ModuleType, code: int, stdout: str = ""
+) -> None:
+    def run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["python"], code, stdout=stdout, stderr="boom")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+
+def test_a_transient_exit_raises_an_exception_airflow_retries(
+    dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before this every non-zero exit was AirflowFailException, so the two
+    retries in DEFAULT_ARGS never applied to a network blip."""
+    _exits(monkeypatch, dag_module, dag_module.TRANSIENT_EXIT_CODE)
+
+    with pytest.raises(AirflowException) as excinfo:
+        dag_module.run_module("credit_risk.data.download")
+
+    assert not isinstance(excinfo.value, AirflowFailException)
+
+
+def test_any_other_non_zero_exit_fails_without_a_retry(
+    dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exits(monkeypatch, dag_module, 1)
+
+    with pytest.raises(AirflowFailException, match="exited with 1"):
+        dag_module.run_module("credit_risk.data.validate")
+
+
+def test_a_clean_exit_returns_what_the_module_printed(
+    dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exits(monkeypatch, dag_module, 0, stdout="/opt/airflow/data/raw/x.parquet\n")
+
+    assert dag_module.run_module("credit_risk.data.download").strip().endswith("x.parquet")
+
+
+def test_the_download_task_has_retries_to_use(pipeline: DAG) -> None:
+    assert pipeline.get_task("download_raw").retries >= 1

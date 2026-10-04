@@ -19,8 +19,9 @@ import json
 import logging
 import os
 import tempfile
+import time
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
@@ -53,6 +54,21 @@ USER_AGENT: Final = (
 # and a retry costs a full 5.5 MB of bandwidth.
 REQUEST_TIMEOUT: Final[tuple[int, int]] = (10, 180)
 
+# Retries inside one task attempt. Waits of 2, 4 and 8 seconds ride out a
+# dropped connection or a 503 from a busy archive; anything longer is the DAG's
+# job, which is what EXIT_TRANSIENT hands it.
+FETCH_ATTEMPTS: Final = 4
+BACKOFF_SECONDS: Final = 2.0
+# Statuses that say "try again later". Any other 4xx means the request itself
+# is wrong -- a moved URL, a refused user agent -- and repeating it changes nothing.
+TRANSIENT_STATUS: Final[frozenset[int]] = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Exit status for "failed for a reason that may clear on its own": EX_TEMPFAIL
+# from sysexits.h. The DAG turns every other non-zero exit into a failure that
+# is not retried, and this one into a retry; dags/credit_risk_pipeline.py keeps
+# its own copy as TRANSIENT_EXIT_CODE and a test holds the two equal.
+EXIT_TRANSIENT: Final = 75
+
 # Measured 2026-09-30. UCI publishes no checksum, so this is the only integrity
 # signal we have; a mismatch is reported, not enforced, because a legitimate
 # re-export would otherwise wedge the pipeline.
@@ -61,6 +77,10 @@ EXPECTED_ZIP_BYTES: Final = 5_539_494
 
 class DownloadError(RuntimeError):
     """The archive could not be fetched, or was not the archive we expected."""
+
+
+class TransientDownloadError(DownloadError):
+    """The archive is still unreachable after every retry, for a reason that may pass."""
 
 
 def raw_parquet_path() -> Path:
@@ -98,11 +118,47 @@ def load_raw_metadata(parquet_path: Path | None = None) -> dict[str, Any]:
     return loaded
 
 
-def _fetch(url: str) -> bytes:
-    """GET the archive, returning its bytes."""
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.content
+def _fetch(
+    url: str,
+    *,
+    attempts: int = FETCH_ATTEMPTS,
+    backoff: float = BACKOFF_SECONDS,
+    sleep: Callable[[float], object] = time.sleep,
+) -> bytes:
+    """GET the archive, retrying what may be transient, and return its bytes.
+
+    A connection error, a timeout, a body cut off mid-transfer and the statuses
+    in :data:`TRANSIENT_STATUS` are retried with exponential backoff. Any other
+    HTTP error raises :class:`DownloadError` at once. Running out of attempts
+    raises :class:`TransientDownloadError`, which the CLI reports as
+    :data:`EXIT_TRANSIENT` so the scheduler retries the task later.
+    """
+    last = "no attempt made"
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
+            )
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        else:
+            status = int(response.status_code)
+            if status < 400:
+                return bytes(response.content)
+            if status not in TRANSIENT_STATUS:
+                raise DownloadError(f"HTTP {status} from {url}; not retrying a request error")
+            last = f"HTTP {status}"
+        if attempt < attempts:
+            delay = backoff * 2 ** (attempt - 1)
+            log.warning(
+                "fetch attempt %d/%d failed (%s); retrying in %.0fs", attempt, attempts, last, delay
+            )
+            sleep(delay)
+    raise TransientDownloadError(f"{url} still failing after {attempts} attempts: {last}")
 
 
 def _read_archive(payload: bytes) -> pd.DataFrame:
@@ -248,7 +304,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    path = download_raw(dest=args.dest, force=args.force)
+    try:
+        path = download_raw(dest=args.dest, force=args.force)
+    except TransientDownloadError as exc:
+        # Not a traceback and exit 1: that would read as a defect, and the DAG
+        # fails a defect without retrying. This is the archive having a bad day.
+        log.error("%s -- exiting %d so the scheduler retries later", exc, EXIT_TRANSIENT)
+        return EXIT_TRANSIENT
     # stdout is the contract for shell and subprocess callers; logs go to stderr.
     print(path)
     return 0

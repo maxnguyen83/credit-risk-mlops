@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowFailException
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.models.baseoperator import chain
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,12 @@ REPORT_MODULE: Final = "credit_risk.models.report"
 # Subprocess budget. HPO with 5-fold CV on 20,000 rows is minutes, not hours;
 # an hour means something is wedged and the task should say so.
 SUBPROCESS_TIMEOUT: Final = 3600
+
+# Exit status a module uses for "failed for a reason that may clear on its own"
+# (EX_TEMPFAIL). credit_risk.data.download.EXIT_TRANSIENT is the same number; it
+# is copied rather than imported because this interpreter cannot import the
+# project (ADR 0006), and tests/data_quality/test_raw.py holds the two equal.
+TRANSIENT_EXIT_CODE: Final = 75
 
 DEFAULT_ARGS: Final[dict[str, Any]] = {
     "owner": "p1-data",
@@ -115,13 +121,8 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
-def run_module(module: str, *args: str, expect_output: bool = True) -> str:
-    """Run ``<project python> -m <module>`` and return its stdout.
-
-    Failures raise AirflowFailException rather than a generic error: a module
-    that exits non-zero is a real defect, and retrying it two more times only
-    delays the alert.
-    """
+def _execute(module: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``<project python> -m <module>`` and hand back what happened."""
     command = [_project_python(), "-m", module, *args]
     log.info("running: %s", " ".join(command))
     try:
@@ -144,12 +145,39 @@ def run_module(module: str, *args: str, expect_output: bool = True) -> str:
 
     if completed.stderr:
         log.info("stderr from %s:\n%s", module, completed.stderr.strip())
-    if completed.returncode != 0:
-        raise AirflowFailException(
-            f"{module} exited with {completed.returncode}. "
-            f"stdout: {completed.stdout.strip()[-2000:]} "
-            f"stderr: {completed.stderr.strip()[-2000:]}"
+    return completed
+
+
+def _raise_for_exit(module: str, completed: subprocess.CompletedProcess[str]) -> None:
+    """Turn a non-zero exit into the right kind of Airflow failure.
+
+    TRANSIENT_EXIT_CODE raises a plain AirflowException, which Airflow retries
+    with DEFAULT_ARGS' backoff: the module has already retried what it could
+    and is saying "later". Every other code is a real defect -- bad data, a
+    refused gate, a crash -- and raises AirflowFailException, because retrying
+    those only delays the alert.
+    """
+    if completed.returncode == 0:
+        return
+    detail = (
+        f"stdout: {completed.stdout.strip()[-2000:]} stderr: {completed.stderr.strip()[-2000:]}"
+    )
+    if completed.returncode == TRANSIENT_EXIT_CODE:
+        raise AirflowException(
+            f"{module} failed transiently (exit {TRANSIENT_EXIT_CODE}); Airflow will retry. "
+            + detail
         )
+    raise AirflowFailException(f"{module} exited with {completed.returncode}. {detail}")
+
+
+def run_module(module: str, *args: str, expect_output: bool = True) -> str:
+    """Run ``<project python> -m <module>`` and return its stdout.
+
+    A non-zero exit fails the task without a retry, except TRANSIENT_EXIT_CODE,
+    which is retried (see :func:`_raise_for_exit`).
+    """
+    completed = _execute(module, *args)
+    _raise_for_exit(module, completed)
     if expect_output and not completed.stdout.strip():
         # Every module invoked here prints its result to stdout: the parquet
         # path, the validation report, the splits manifest, the run summary.
@@ -186,7 +214,12 @@ def credit_risk_pipeline() -> None:
 
     @task(task_id="download_raw")
     def download_raw_task() -> str:
-        """Fetch the UCI archive and land it as parquet. Idempotent by design."""
+        """Fetch the UCI archive and land it as parquet. Idempotent by design.
+
+        The module retries a dropped connection or a 5xx itself, and exits
+        TRANSIENT_EXIT_CODE when the archive stays unreachable; that one exit
+        is retried by Airflow (DEFAULT_ARGS), every other failure is not.
+        """
         return run_module(DOWNLOAD_MODULE).strip()
 
     @task(task_id="validate_raw")

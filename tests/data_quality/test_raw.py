@@ -12,6 +12,7 @@ ingestion tests below them stub the network and run everywhere.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -21,11 +22,13 @@ from typing import Final
 
 import pandas as pd
 import pytest
+import requests
 
 from credit_risk import schema
 from credit_risk.data import download as download_module
 from credit_risk.data.download import (
     DownloadError,
+    TransientDownloadError,
     download_raw,
     load_raw,
     load_raw_metadata,
@@ -261,6 +264,105 @@ class TestIngestion:
 
         assert download_module.main(["--dest", str(dest)]) == 0
         assert capsys.readouterr().out.strip() == str(dest)
+
+
+class _Response:
+    """The two attributes of requests.Response the fetch reads."""
+
+    def __init__(self, status_code: int, content: bytes = b"") -> None:
+        self.status_code = status_code
+        self.content = content
+
+
+def _scripted_get(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[Exception | _Response]
+) -> list[str]:
+    """Replace requests.get with one that plays ``outcomes`` in order."""
+    calls: list[str] = []
+
+    def get(url: str, **kwargs: object) -> _Response:
+        calls.append(url)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(download_module.requests, "get", get)
+    return calls
+
+
+class TestTransientFailures:
+    """UCI has bad days. A blip must be retried; a wrong URL must not be."""
+
+    def test_a_dropped_connection_is_retried_with_backoff(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = _scripted_get(
+            monkeypatch,
+            [
+                requests.ConnectionError("reset by peer"),
+                requests.Timeout("read timed out"),
+                _Response(200, b"the-zip"),
+            ],
+        )
+        slept: list[float] = []
+
+        assert download_module._fetch(schema.DATASET_URL, sleep=slept.append) == b"the-zip"
+
+        assert len(calls) == 3
+        assert slept == [download_module.BACKOFF_SECONDS, 2 * download_module.BACKOFF_SECONDS]
+
+    def test_a_server_error_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _scripted_get(monkeypatch, [_Response(503), _Response(200, b"zip")])
+
+        assert download_module._fetch(schema.DATASET_URL, sleep=lambda s: None) == b"zip"
+        assert len(calls) == 2
+
+    def test_a_client_error_is_not_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A 404 means the URL is wrong. Retrying it only delays the red task."""
+        calls = _scripted_get(monkeypatch, [_Response(404), _Response(200, b"zip")])
+
+        with pytest.raises(DownloadError, match="404") as excinfo:
+            download_module._fetch(schema.DATASET_URL, sleep=lambda s: None)
+
+        assert not isinstance(excinfo.value, TransientDownloadError)
+        assert len(calls) == 1
+
+    def test_a_source_that_stays_down_is_reported_as_transient(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        attempts = download_module.FETCH_ATTEMPTS
+        calls = _scripted_get(monkeypatch, [_Response(502) for _ in range(attempts)])
+
+        with pytest.raises(TransientDownloadError, match="502"):
+            download_module._fetch(schema.DATASET_URL, sleep=lambda s: None)
+        assert len(calls) == attempts
+
+    def test_the_cli_exits_with_the_transient_code_so_the_dag_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def down(url: str) -> bytes:
+            raise TransientDownloadError("still 503 after 4 attempts")
+
+        monkeypatch.setattr(download_module, "_fetch", down)
+
+        code = download_module.main(["--dest", str(tmp_path / "raw.parquet")])
+
+        assert code == download_module.EXIT_TRANSIENT == 75
+
+    def test_the_dag_retries_on_the_exit_code_the_download_uses(self) -> None:
+        """The DAG cannot import this package (ADR 0006), so it keeps its own
+        copy of the number. This is what stops the two drifting apart."""
+        dag_file = Path(__file__).resolve().parents[2] / "dags" / "credit_risk_pipeline.py"
+        tree = ast.parse(dag_file.read_text())
+        assigned = {
+            node.target.id: node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        value = assigned.get("TRANSIENT_EXIT_CODE")
+        assert isinstance(value, ast.Constant), "dags/ must define TRANSIENT_EXIT_CODE"
+        assert value.value == download_module.EXIT_TRANSIENT
 
 
 class TestProvenance:

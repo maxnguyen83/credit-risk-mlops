@@ -841,3 +841,15 @@ def test_the_api_url_defaults_to_the_environment(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.delenv("CREDIT_API_URL")
     assert Settings(_env_file=None).credit_api_url == "http://localhost:18000"
+
+
+def test_the_transient_exit_matches_the_dags_retry_convention() -> None:
+    """dags/credit_risk_scoring.py keeps its own copy; the DAG cannot import this."""
+    from credit_risk.data.download import EXIT_TRANSIENT
+
+    assert batch.EXIT_TRANSIENT == EXIT_TRANSIENT
+    dag_source = (
+        Path(__file__).resolve().parents[2] / "dags" / "credit_risk_scoring.py"
+    ).read_text()
+    assert f"TRANSIENT_EXIT_CODE: Final = {EXIT_TRANSIENT}" in dag_source
+    assert 'SCORING_MODULE: Final = "credit_risk.scoring.batch"' in dag_source

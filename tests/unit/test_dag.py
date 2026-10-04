@@ -70,8 +70,10 @@ def test_the_dag_folder_imports_without_errors(dagbag: DagBag) -> None:
     assert dagbag.import_errors == {}
 
 
-def test_the_pipeline_is_the_only_dag(dagbag: DagBag) -> None:
-    assert set(dagbag.dag_ids) == {DAG_ID}
+def test_the_folder_holds_the_pipeline_and_the_scoring_dag_only(dagbag: DagBag) -> None:
+    # credit_risk_scoring.py copies this file's runner and callbacks rather
+    # than importing it; an import would register this DAG a second time.
+    assert set(dagbag.dag_ids) == {DAG_ID, "credit_risk_scoring"}
 
 
 def test_the_pipeline_has_exactly_the_eight_documented_tasks(pipeline: DAG) -> None:

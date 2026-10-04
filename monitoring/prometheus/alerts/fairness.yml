@@ -39,6 +39,16 @@ groups:
         # dashboard: a heavily skewed traffic mix makes the minority series
         # disappear rather than turn red. That is the monitor declining to
         # measure what it cannot measure.
+        #
+        # The margin is thin, by choice. On the running stack the gap measured
+        # 0.046 under the normal arrival mix (male 0.128, female 0.082): 0.004
+        # below this threshold. It stays at 0.05 because that is the
+        # registration gate's limit -- one policy, enforced at training time and
+        # in production -- and the price is that an ordinary change in who
+        # applies can carry the gap across the line and back, so this alert can
+        # flap. Do not widen it here to make it quiet: a number here that differs
+        # from the gate's is two policies, and nobody decided the second one.
+        # ETHICS.md section 4 has the reasoning and what to do when it flaps.
         expr: (max(credit_selection_rate) - min(credit_selection_rate)) > 0.05
         for: 15m
         labels:
@@ -50,10 +60,17 @@ groups:
             The widest gap in intervention rate between protected groups is
             {{ $value | printf "%.3f" }}, above the 0.05 demographic-parity gate
             the pipeline enforces at training time, sustained for 15 minutes.
-            Note what is NOT wrong: the API is up, errors are at zero and latency
-            is inside budget. Read the per-group rates with
-            `credit_selection_rate` and check whether the traffic mix changed
-            (a skewed request population can widen the gap without the model
-            changing at all) before concluding the model regressed. Escalate to
-            compliance, not to the on-call engineer -- there is nothing to
-            restart.
+            The API is up, errors are at zero and latency is inside budget:
+            there is nothing to restart. Known trade-off: normal traffic
+            measured a gap of 0.046, so this limit has 0.004 of headroom and
+            the alert can flap -- fire, resolve, fire again -- on an ordinary
+            change in who applies. Read the per-group rates with
+            `credit_selection_rate` and compare the traffic mix, the serving
+            model version and THRESHOLD_POLICY with the last quiet period, then
+            hand it to compliance, not the on-call engineer, with what you
+            found. If only the mix moved and it is flapping, a time-boxed
+            Alertmanager silence that names the reason stops the noise and
+            leaves the alert visible in the UI. Do not edit the threshold: it is
+            the registration gate's, and changing it is a compliance decision
+            that moves both. If the model or the policy changed, or the gap
+            keeps widening, treat it as a regression.

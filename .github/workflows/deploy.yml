@@ -1,0 +1,282 @@
+name: Deploy
+
+# Continuous deployment onto the machine that runs the stack.
+#
+# CI (ci.yml) runs on GitHub's machines because it has to be green when nobody's
+# laptop is awake. Deployment is the opposite problem: its target is one
+# particular machine -- the one with the compose stack, the MLflow registry and
+# the model in its volumes -- and a GitHub-hosted runner cannot reach it. So
+# this job, and only this job, runs on a self-hosted runner on that machine.
+# The trade-off is ARCHITECTURE.md D8; registering the runner is docs/RUNNER.md.
+#
+# One run, in order:
+#   1. deploy only a commit on main that CI passed -- the exact SHA it tested;
+#   2. rebuild the images and update the stack in place, volumes untouched;
+#   3. register a model if, and only if, the registry has none in Production;
+#   4. restart the API so it loads whatever Production holds now;
+#   5. fail unless the API serves the version the registry says it should.
+#
+# The runner is assumed to be a macOS host running Docker through Colima, so:
+# no sudo anywhere, bash 3.2-compatible scripts, and `docker compose` v2.
+
+on:
+  workflow_run:
+    # Matched by the CI workflow's `name:`. Renaming CI disconnects deployment.
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read # a manual run checks CI's run history for the commit
+
+jobs:
+  deploy:
+    name: deploy to the stack host
+    runs-on: [self-hosted, credit-risk]
+    # workflow_run fires for CI runs of pull requests too, and `branches` is
+    # matched against the head branch -- which a fork can also call `main`.
+    # So the event must be a push, to this repository, that CI passed. Never
+    # pull_request: code from a PR must not reach this machine.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_branch == 'main'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    # One deploy at a time on the one host. Not cancel-in-progress: killing a
+    # deploy halfway through `up` or a training run leaves the stack in a state
+    # no commit describes. A newer run waits; if several queue, GitHub keeps
+    # only the latest pending one, which is the commit that should be live.
+    # On the job rather than the workflow so that the runs the `if` above
+    # skips -- a CI run on main that failed, or one that was not a push --
+    # never take a place in the queue and cancel a real deploy waiting there.
+    concurrency:
+      group: deploy-local
+      cancel-in-progress: false
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The commit CI tested. github.sha on a workflow_run event is the tip of
+      # the default branch at the time this run starts, which may already be
+      # a newer commit than the one CI just passed.
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      API_URL: http://localhost:18000
+      MLFLOW_URL: http://localhost:15020
+    steps:
+      - name: Preflight — docker, compose and python3 on the runner host
+        run: |
+          # A runner started as a launchd service can come up with a minimal
+          # PATH. Homebrew's prefixes are where docker and colima live on a Mac.
+          for dir in /opt/homebrew/bin /usr/local/bin; do
+            if [[ -d "$dir" && ":$PATH:" != *":$dir:"* ]]; then
+              echo "$dir" >> "$GITHUB_PATH"
+              PATH="$dir:$PATH"
+            fi
+          done
+          if ! command -v docker >/dev/null; then
+            echo "::error::docker CLI not found on PATH=$PATH"
+            exit 1
+          fi
+          docker compose version
+          # Fail rather than start a VM: booting Colima from a CI job would hide
+          # that the host was not in the state the stack expects.
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::Docker daemon not reachable. On macOS start it first (colima start), then re-run this job."
+            exit 1
+          fi
+          python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "python3 >= 3.9 required")'
+          python3 --version
+
+      - name: Refuse a manual deploy of a commit CI has not passed
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${DEPLOY_SHA}&status=success&per_page=1"
+          passed=$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" "$url" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["total_count"])')
+          if [[ "$passed" -lt 1 ]]; then
+            echo "::error::CI has no successful run for ${DEPLOY_SHA}. Let CI pass on main first."
+            exit 1
+          fi
+          echo "CI passed on ${DEPLOY_SHA}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          # The workspace persists on this host between runs. clean: false keeps
+          # what git ignores -- data/ (the dataset, the splits, the LIME
+          # background) and .env -- which the default `git clean -ffdx` would
+          # delete on every deploy. Tracked files are still reset to DEPLOY_SHA.
+          clean: false
+          # Nothing here pushes, so no token is left in .git/config on the host.
+          persist-credentials: false
+
+      - name: Configure the stack (.env from the host, never from the repo)
+        run: |
+          env_file="${DEPLOY_ENV_FILE:-$HOME/.config/credit-risk/deploy.env}"
+          if [[ -f "$env_file" ]]; then
+            sed '/^GIT_SHA=/d' "$env_file" > .env
+            echo "using ${env_file}"
+          elif docker volume inspect ddm501-credit-risk_pg-data >/dev/null 2>&1; then
+            # Postgres takes its password from the .env that first initialised
+            # the volume, and ignores any other afterwards. The example's
+            # placeholders would leave MLflow unable to log in.
+            echo "::error::${env_file} is missing and the registry volume already exists. Copy the .env that created it there (docs/RUNNER.md)."
+            exit 1
+          else
+            cp .env.example .env
+            echo "::warning::${env_file} is missing: a fresh stack starts with the placeholders from .env.example"
+          fi
+          chmod 600 .env
+          # Mask secret values before any later step can print one.
+          while IFS='=' read -r key value; do
+            value="${value%\"}"
+            value="${value#\"}"
+            case "$key" in
+              *PASSWORD* | *TOKEN* | *SECRET*)
+                if [[ -n "$value" ]]; then echo "::add-mask::${value}"; fi
+                ;;
+            esac
+          done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
+          # Reported by /version, and kept in .env so a later `docker compose`
+          # run by hand in this directory does not reset it to "unknown".
+          echo "GIT_SHA=${DEPLOY_SHA}" >> .env
+
+      - name: Build images
+        timeout-minutes: 40
+        run: docker compose build
+
+      - name: Update the stack in place (volumes kept)
+        timeout-minutes: 15
+        # `up -d` recreates only the containers whose image or configuration
+        # changed. Never `down -v` here: the named volumes are Postgres (every
+        # run and the model registry) and the object store (every artifact).
+        run: docker compose up -d --remove-orphans
+
+      - name: Wait for the platform services
+        timeout-minutes: 15
+        env:
+          WAIT_SECONDS: "600"
+        # credit-api is left out on purpose. Its healthcheck passes only once
+        # a model is loaded, and on a fresh registry that is three steps away.
+        run: ./scripts/stack_health.sh wait postgres objectstore mlflow airflow
+
+      - name: Make sure the dataset is on disk
+        timeout-minutes: 15
+        # The API reads ./data (mounted read-only) for the LIME background and
+        # the drift baseline. Without it /explain answers 503 and
+        # FeatureDriftHigh can never fire. Download is skipped when the parquet
+        # exists and the split is deterministic, so this is safe to repeat.
+        run: |
+          if compgen -G "data/processed/*.parquet" >/dev/null; then
+            echo "processed splits present"
+            exit 0
+          fi
+          # shellcheck disable=SC2016 # $CREDIT_RISK_PYTHON expands in the container
+          docker compose exec -T \
+            -e DATA_DIR=/opt/airflow/data \
+            -e RAW_DIR=/opt/airflow/data/raw \
+            -e PROCESSED_DIR=/opt/airflow/data/processed \
+            airflow bash -c '"$CREDIT_RISK_PYTHON" -m credit_risk.data.download && "$CREDIT_RISK_PYTHON" -m credit_risk.data.split'
+          compgen -G "data/processed/*.parquet" >/dev/null
+
+      - name: Register a model if the registry has none
+        id: model
+        timeout-minutes: 60
+        run: |
+          rc=0
+          version=$(python3 scripts/verify_deploy.py --registry-version) || rc=$?
+          case "$rc" in
+            0)
+              echo "Production already holds version ${version}; not retraining"
+              echo "bootstrapped=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            3)
+              echo "no Production version yet: running the pipeline once"
+              ;;
+            *)
+              # Exit 1 is "could not read the registry", which is not "empty":
+              # retraining then could replace a Production model that is there.
+              echo "::error::could not read the MLflow registry; not training against it"
+              exit 1
+              ;;
+          esac
+          # The same command as `make dag-test`: download, validate, split,
+          # train, gate, register, report. Registration happens only if the
+          # performance and fairness gates pass.
+          docker compose exec -T airflow \
+            airflow dags test credit_risk_pipeline "$(date -u +%Y-%m-%d)"
+          if ! version=$(python3 scripts/verify_deploy.py --registry-version); then
+            echo "::error::the pipeline ran but nothing reached Production: the gate refused the candidate or a task failed (see the DAG output above)"
+            exit 1
+          fi
+          echo "registered and promoted version ${version}"
+          echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Restart the API so it loads the current Production model
+        # The model is resolved once, at startup (D3). Without this restart a
+        # promotion made since the API booted stays invisible: health green,
+        # version stale. verify_deploy.py below is what would catch it.
+        run: docker compose restart credit-api
+
+      - name: Wait for every service, the API included
+        timeout-minutes: 10
+        env:
+          WAIT_SECONDS: "300"
+        run: ./scripts/stack_health.sh wait
+
+      - name: Verify the API serves the registry's Production model
+        timeout-minutes: 5
+        run: >-
+          python3 scripts/verify_deploy.py
+          --expect-git-sha "$DEPLOY_SHA"
+          --summary "$RUNNER_TEMP/deploy-model.md"
+
+      - name: Container state and API, MLflow and Airflow logs
+        if: failure()
+        run: |
+          ./scripts/stack_health.sh table || true
+          docker compose logs --no-color --tail 100 credit-api mlflow airflow || true
+
+      - name: Job summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          BOOTSTRAPPED: ${{ steps.model.outputs.bootstrapped || 'unknown' }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url || '' }}
+        run: |
+          {
+            echo "## Deploy: ${JOB_STATUS}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | [\`${DEPLOY_SHA:0:7}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${DEPLOY_SHA}) |"
+            if [[ -n "$CI_RUN_URL" ]]; then
+              echo "| tested by | [CI run](${CI_RUN_URL}) |"
+            fi
+            echo "| trigger | \`${GITHUB_EVENT_NAME}\` by ${GITHUB_ACTOR} |"
+            echo "| runner | ${RUNNER_NAME} (${RUNNER_OS} ${RUNNER_ARCH}) |"
+            echo "| model trained this run | ${BOOTSTRAPPED} |"
+            echo
+            if [[ -f "$RUNNER_TEMP/deploy-model.md" ]]; then
+              cat "$RUNNER_TEMP/deploy-model.md"
+            else
+              echo "_The model check did not run; see the failed step._"
+            fi
+            echo
+            echo "### Services"
+            echo
+            if [[ -x scripts/stack_health.sh ]]; then
+              ./scripts/stack_health.sh table || echo "_Docker did not answer._"
+            else
+              echo "_Not checked out._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

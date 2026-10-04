@@ -1,0 +1,5 @@
+# actionlint configuration. The one custom runner label in this repository:
+# deploy.yml runs on the self-hosted runner registered with it (docs/RUNNER.md).
+self-hosted-runner:
+  labels:
+    - credit-risk

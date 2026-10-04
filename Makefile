@@ -64,7 +64,7 @@ logs: ## follow api logs
 smoke: ## assert the running stack answers correctly
 	./scripts/smoke.sh
 
-deploy-check: ## the API serves the registry's Production model (deploy.yml's last check)
+deploy-check: ## the API serves the registry's champion model (deploy.yml's last check)
 	python3 scripts/verify_deploy.py
 
 traffic: ## normal traffic

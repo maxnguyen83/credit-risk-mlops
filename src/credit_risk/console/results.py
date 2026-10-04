@@ -95,14 +95,14 @@ def _finite(value: Any) -> Any:
 def run_directory(data_dir: Path, run_dir: Any) -> Path | None:
     """The folder of the latest run, or None if run_dir does not name one inside ``scored/``.
 
-    An absolute run_dir is a path inside the Airflow container (its mount point
-    differs from this one), so only its last component is kept.
+    A run folder is always a direct child of ``scored/``, so only the last
+    component is kept: the scorer writes it relative to the data dir
+    ("scored/<stamp>"), and an absolute path would be one inside the Airflow
+    container, whose mount point differs from this one.
     """
     if not isinstance(run_dir, str) or not run_dir.strip():
         return None
-    candidate = PurePosixPath(run_dir.strip())
-    if candidate.is_absolute():
-        candidate = PurePosixPath(candidate.name)
+    candidate = PurePosixPath(PurePosixPath(run_dir.strip()).name)
     root = _scored_root(data_dir).resolve()
     resolved = (root / candidate).resolve()
     if root not in resolved.parents:

@@ -233,6 +233,15 @@ def test_an_absolute_run_dir_from_the_airflow_container_is_found_by_name(tmp_pat
     assert results.latest(tmp_path, limit=50)["n_rows_total"] == 7
 
 
+def test_the_run_dir_the_scorer_writes_is_found(tmp_path: Path) -> None:
+    # credit_risk.scoring.batch records run_dir relative to the data dir
+    # ("scored/<stamp>"), so it reads the same in every container.
+    write_results(tmp_path)
+    summary = {**SUMMARY, "run_dir": "scored/20261004T102000Z"}
+    (tmp_path / "scored" / "latest.json").write_text(json.dumps(summary), encoding="utf-8")
+    assert results.latest(tmp_path, limit=50)["n_rows_total"] == 7
+
+
 @pytest.mark.parametrize("run_dir", ["..", "../..", "../outside", "", ".", None, 7])
 def test_a_run_dir_that_escapes_the_results_folder_is_ignored(tmp_path: Path, run_dir: Any) -> None:
     data_dir = tmp_path / "data"

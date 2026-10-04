@@ -55,7 +55,7 @@ expect() {
   done
 }
 
-expect pipeline alertname=PipelineTaskFailed severity=critical dag_id=credit_risk_training task_id=train
+expect pipeline alertname=PipelineTaskFailed severity=critical dag_id=credit_risk_pipeline task_id=train_candidates
 expect critical alertname=ModelNotLoaded severity=critical component=model
 expect critical alertname=ApiDown severity=critical component=serving
 expect warning alertname=FairnessGapExceeded severity=warning component=fairness
@@ -86,19 +86,31 @@ expect_start "empty secrets directory" "$NOOP" "$secrets"
 printf '%s' '123456:not-a-real-token' > "$secrets/telegram_bot_token"
 expect_start "token without chat id" "$NOOP" "$secrets"
 
-for bad in abc 12-3 0 '-' ''; do
-  printf '%s' "$bad" > "$secrets/telegram_chat_id"
+# Leading zeros are octal to YAML (0123 would become chat 83); two lines would
+# be glued into one number; anything but digits and a leading minus is not an id.
+for bad in abc 12-3 '12 34' 0 00 0123 -0123 '-' '' '123\n456' '  \n\n'; do
+  printf '%b' "$bad" > "$secrets/telegram_chat_id"
   expect_start "chat id '$bad'" "$NOOP" "$secrets"
 done
 
+# filled_in ID: the generated config carries exactly this chat id and loads.
+filled_in() {
+  if grep -q "^ *chat_id: $1\$" /tmp/alertmanager.yml \
+    && amtool check-config /tmp/alertmanager.yml > /dev/null; then
+    ok "filled-in config carries chat id $1 and loads"
+  else
+    fail "filled-in config: chat id $1 not substituted, or it does not load"
+  fi
+}
+
 printf '%s\n' '-1001234567890' > "$secrets/telegram_chat_id"
 expect_start "token and group chat id" /tmp/alertmanager.yml "$secrets"
-if grep -q '^ *chat_id: -1001234567890$' /tmp/alertmanager.yml \
-  && amtool check-config /tmp/alertmanager.yml > /dev/null; then
-  ok "filled-in config carries the chat id and loads"
-else
-  fail "filled-in config: chat id not substituted, or it does not load"
-fi
+filled_in -1001234567890
+
+# Blank lines, surrounding spaces and a Windows line ending are tolerated.
+printf '\n  4242  \r\n\n' > "$secrets/telegram_chat_id"
+expect_start "token and private chat id, padded" /tmp/alertmanager.yml "$secrets"
+filled_in 4242
 
 chmod 000 "$secrets/telegram_bot_token"
 expect_start "unreadable token file" "$NOOP" "$secrets"

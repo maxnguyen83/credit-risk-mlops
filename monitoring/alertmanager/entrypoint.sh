@@ -45,10 +45,17 @@ telegram_config() {
     fi
   done
 
-  chat_id=$(tr -d ' \t\r\n' < "$CHAT_FILE")
+  # One non-empty line holding a plain integer. Two lines would otherwise be
+  # glued into a different number, and YAML reads a leading zero as octal, so
+  # 0123 would quietly become chat 83.
+  if [ "$(grep -c '[^[:space:]]' "$CHAT_FILE")" != 1 ]; then
+    off "telegram_chat_id must hold exactly one non-empty line"
+    return 1
+  fi
+  chat_id=$(grep '[^[:space:]]' "$CHAT_FILE" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   case $chat_id in
-    '' | - | *[!0-9-]* | ?*-* | 0 | -0*)
-      off "telegram_chat_id must be a non-zero integer (a group's id is negative)"
+    '' | - | *[!0-9-]* | ?*-* | 0* | -0*)
+      off "telegram_chat_id must be a non-zero integer with no leading zero (a group's id is negative)"
       return 1
       ;;
   esac

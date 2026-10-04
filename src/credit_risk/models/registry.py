@@ -119,6 +119,28 @@ TEST_SPLIT_PARAM: Final = "data_test_sha256"
 # PR-AUC differences this small are float noise, not a verdict.
 _EPSILON: Final = 1e-12
 
+# The error codes MLflow uses for "there is nothing there": a model, version
+# or alias that does not exist. Measured on the SQL, file and REST stores of
+# MLflow 2.19 -- a missing alias is INVALID_PARAMETER_VALUE on all three. Any
+# other failure (a 5xx, a timeout, an exhausted DB pool) means the registry
+# could not be read, which is not the same as the registry being empty.
+NOT_FOUND_ERRORS: Final = frozenset({"RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"})
+
+# Exit code of the registration command when the candidate was registered but
+# the promotion it earned -- champion or challenger -- could not be written.
+# Distinct from 2 (refused by the gate, or nothing to register), and non-zero
+# so the DAG's register_model task fails rather than going green over a
+# half-written registry.
+EXIT_PROMOTION_FAILED: Final = 3
+
+
+class RegistryUnreadable(Exception):
+    """A registry lookup failed for a reason other than "not found"."""
+
+
+def _not_found(exc: BaseException) -> bool:
+    return getattr(exc, "error_code", None) in NOT_FOUND_ERRORS
+
 
 @dataclass(frozen=True)
 class RegistrationDecision:
@@ -155,6 +177,10 @@ class VersionMetadata:
     # that names it that way. None when it was looked up by number.
     resolved_by: str | None = None
     resolved_uri: str | None = None
+    # Lookups that failed for a reason other than "not found" on the way to
+    # this version -- an alias that could not be read before the stage
+    # answered. Empty when the resolution was clean.
+    resolution_errors: tuple[str, ...] = ()
 
     @property
     def model_uri(self) -> str:
@@ -443,16 +469,38 @@ def current_production_version(
     """
     name = settings.model_name if model_name is None else model_name
     target = settings.model_stage if stage is None else stage
-    active = _client(client)
     try:
-        versions = active.get_latest_versions(name, stages=[target])
+        return _stage_lookup(name, target, _client(client))
+    except RegistryUnreadable as exc:
+        logger.warning("%s", exc)
+        return None
+
+
+def _stage_lookup(name: str, stage: str, client: MlflowClient) -> str | None:
+    """The version in `stage`; None if none is; RegistryUnreadable if the store cannot say."""
+    try:
+        versions = client.get_latest_versions(name, stages=[stage])
     except StoreError as exc:
-        logger.warning("no registry entry for %s at stage %s: %s", name, target, exc)
+        if not _not_found(exc):
+            raise RegistryUnreadable(f"could not read {name} at stage {stage}: {exc}") from exc
+        logger.info("no registry entry for %s at stage %s: %s", name, stage, exc)
         return None
     if not versions:
-        logger.info("model %s has no version in stage %s yet", name, target)
+        logger.info("model %s has no version in stage %s yet", name, stage)
         return None
     return str(versions[0].version)
+
+
+def _alias_lookup(name: str, alias: str, client: MlflowClient) -> str | None:
+    """The version `alias` names; None if it names none; RegistryUnreadable if unknowable."""
+    try:
+        found = client.get_model_version_by_alias(name, alias)
+    except StoreError as exc:
+        if not _not_found(exc):
+            raise RegistryUnreadable(f"could not read {name}@{alias}: {exc}") from exc
+        logger.info("%s@%s resolves to nothing: %s", name, alias, exc)
+        return None
+    return str(found.version)
 
 
 def version_metadata(
@@ -469,6 +517,11 @@ def version_metadata(
     except StoreError as exc:
         logger.warning("could not read %s v%s from the registry: %s", name, version, exc)
         return None
+    return _as_metadata(name, found)
+
+
+def _as_metadata(name: str, found: Any) -> VersionMetadata:
+    """An MLflow ModelVersion as the plain record the rest of the code reads."""
     stage = getattr(found, "current_stage", None)
     return VersionMetadata(
         model_name=name,
@@ -486,20 +539,53 @@ def alias_version(
     model_name: str | None = None,
     client: MlflowClient | None = None,
 ) -> str | None:
-    """The version number `alias` points at, or None if it points nowhere.
+    """The version number `alias` points at, or None if it points nowhere or cannot be read.
 
-    "No such alias" and "registry unreachable" both come back as None: the
-    caller falls back to the stage either way, and an unreachable registry
-    fails that lookup too, so nothing is served on a guess.
+    Lenient, for callers that write next: `set_champion` sets the alias when
+    this is not already its version, and a registry that cannot be read here
+    refuses that write too. Decisions that read only -- the comparison with the
+    champion -- use `resolve_champion`, which tells the two apart.
     """
     name = settings.model_name if model_name is None else model_name
     wanted = settings.model_alias if alias is None else alias
     try:
-        found = _client(client).get_model_version_by_alias(name, wanted)
-    except StoreError as exc:
-        logger.info("%s@%s resolves to nothing: %s", name, wanted, exc)
+        return _alias_lookup(name, wanted, _client(client))
+    except RegistryUnreadable as exc:
+        logger.warning("%s", exc)
         return None
-    return str(found.version)
+
+
+def resolve_champion(
+    *,
+    model_name: str | None = None,
+    stage: str | None = None,
+    alias: str | None = None,
+    client: MlflowClient | None = None,
+) -> VersionMetadata | None:
+    """The champion -- alias first, then stage -- or None only if the registry has none.
+
+    Strict: any lookup that fails for a reason other than "not found" raises
+    RegistryUnreadable. An unreadable registry is not an empty one, and the
+    comparison that decides whether to promote must not mistake one for the
+    other.
+    """
+    name = settings.model_name if model_name is None else model_name
+    wanted_alias = settings.model_alias if alias is None else alias
+    wanted_stage = settings.model_stage if stage is None else stage
+    active = _client(client)
+
+    version = _alias_lookup(name, wanted_alias, active)
+    resolved_by, resolved_uri = "alias", f"models:/{name}@{wanted_alias}"
+    if version is None:
+        version = _stage_lookup(name, wanted_stage, active)
+        if version is None:
+            return None
+        resolved_by, resolved_uri = "stage", f"models:/{name}/{wanted_stage}"
+    try:
+        found = active.get_model_version(name, version)
+    except StoreError as exc:
+        raise RegistryUnreadable(f"could not read {name} v{version}: {exc}") from exc
+    return replace(_as_metadata(name, found), resolved_by=resolved_by, resolved_uri=resolved_uri)
 
 
 def production_version_metadata(
@@ -516,6 +602,11 @@ def production_version_metadata(
     is one -- and `resolved_by` says which of the two answered, so `/health`
     can report it rather than leave it to be inferred.
 
+    Lenient, because serving would rather run on the stage than not run: an
+    alias that cannot be read (as opposed to one that does not exist) also
+    falls back to the stage, but the error is logged at WARNING and kept in
+    `resolution_errors` instead of being swallowed.
+
     Serving loads the model by this version's own URI rather than by alias or
     stage. Two lookups by name -- one for the model, one for its tags -- would
     apply the tags of whichever version was promoted in between to the model
@@ -526,27 +617,39 @@ def production_version_metadata(
     wanted_stage = settings.model_stage if stage is None else stage
     active = _client(client)
 
-    version = alias_version(wanted_alias, model_name=name, client=active)
+    errors: list[str] = []
+    try:
+        version = _alias_lookup(name, wanted_alias, active)
+    except RegistryUnreadable as exc:
+        errors.append(str(exc))
+        logger.warning("%s; falling back to the %s stage", exc, wanted_stage)
+        version = None
     resolved_by, resolved_uri = "alias", f"models:/{name}@{wanted_alias}"
     if version is None:
         version = current_production_version(model_name=name, stage=wanted_stage, client=active)
         if version is None:
             return None
         resolved_by, resolved_uri = "stage", f"models:/{name}/{wanted_stage}"
-        logger.warning(
-            "no version of %s carries the %r alias; using version %s from the %s stage. "
-            "`python -m credit_risk.models.registry %s --version %s` sets the alias",
-            name,
-            wanted_alias,
-            version,
-            wanted_stage,
-            SET_CHAMPION_COMMAND,
-            version,
-        )
+        if not errors:
+            logger.warning(
+                "no version of %s carries the %r alias; using version %s from the %s stage. "
+                "`python -m credit_risk.models.registry %s --version %s` sets the alias",
+                name,
+                wanted_alias,
+                version,
+                wanted_stage,
+                SET_CHAMPION_COMMAND,
+                version,
+            )
     found = version_metadata(version, model_name=name, client=active)
     if found is None:
         return None
-    return replace(found, resolved_by=resolved_by, resolved_uri=resolved_uri)
+    return replace(
+        found,
+        resolved_by=resolved_by,
+        resolved_uri=resolved_uri,
+        resolution_errors=tuple(errors),
+    )
 
 
 # -------------------------------------------------------- champion/challenger
@@ -615,7 +718,18 @@ def compare_with_champion(
     if candidate is None:
         candidate = _read_metric(candidate_metrics, PR_AUC_KEYS)
 
-    champion = production_version_metadata(model_name=name, client=active)
+    try:
+        champion = resolve_champion(model_name=name, client=active)
+    except RegistryUnreadable as exc:
+        return PromotionVerdict(
+            False,
+            [
+                f"cannot compare with the champion: the registry could not be read ({exc}); "
+                "left for review"
+            ],
+            candidate_pr_auc=candidate,
+            tolerance=allowed,
+        )
     if champion is None:
         return PromotionVerdict(
             True,
@@ -720,7 +834,8 @@ def set_champion(
             reasons=[f"{name} v{version} is not in the registry, or the registry is unreachable"],
         )
 
-    move_alias = alias_version(target_alias, model_name=name, client=active) != found.version
+    previous = alias_version(target_alias, model_name=name, client=active)
+    move_alias = previous != found.version
     move_stage = found.current_stage != target_stage
     drop_challenger = CHALLENGER_ALIAS in found.aliases
     changed = [
@@ -745,18 +860,43 @@ def set_champion(
         except StoreError as exc:
             reason_text = f"could not point {name}@{target_alias} at v{found.version}: {exc}"
             logger.warning("%s", reason_text)
+            unchanged = (
+                f"nothing was changed: @{target_alias} still names "
+                f"{f'v{previous}' if previous else 'no version'} and v{found.version} "
+                f"is still in {found.current_stage or 'None'}"
+            )
             return replace(
-                done, registered=False, stage=None, alias=None, changed=[], reasons=[reason_text]
+                done,
+                registered=False,
+                stage=None,
+                alias=None,
+                changed=[],
+                reasons=[reason_text, unchanged],
             )
     if move_stage:
         moved = promote(found.version, target_stage, model_name=name, client=active)
         if not moved.registered:
+            # Said in full, because this is the one state where the alias and
+            # the stage name different versions on purpose of nobody's.
+            where = (
+                f"@{target_alias} now names v{found.version}, which the API serves after "
+                f"its next restart"
+                if move_alias
+                else f"@{target_alias} already named v{found.version}"
+            )
+            split = (
+                f"split state: {where}, but v{found.version} is still in "
+                f"{found.current_stage or 'None'} and the {target_stage} stage was not "
+                f"changed; re-run `python -m credit_risk.models.registry "
+                f"{SET_CHAMPION_COMMAND} --version {found.version}` to finish"
+            )
+            logger.warning("%s", split)
             return replace(
                 done,
                 registered=False,
                 stage=found.current_stage,
                 changed=changed[:1] if move_alias else [],
-                reasons=moved.reasons,
+                reasons=[*moved.reasons, split],
             )
     if drop_challenger:
         try:
@@ -794,18 +934,30 @@ def set_challenger(
     except StoreError as exc:
         reason_text = f"could not point {name}@{CHALLENGER_ALIAS} at v{version}: {exc}"
         logger.warning("%s", reason_text)
+        state = (
+            f"v{version} carries the promotion_reason tag but no alias and no stage; "
+            "the champion is untouched"
+        )
         return RegistrationDecision(
-            registered=False, model_name=name, version=str(version), reasons=[reason_text]
+            registered=False, model_name=name, version=str(version), reasons=[reason_text, state]
         )
     moved = promote(str(version), CHALLENGER_STAGE, model_name=name, client=active)
     logger.warning("%s v%s registered as the challenger, not promoted: %s", name, version, reason)
+    failed = (
+        []
+        if moved.registered
+        else [
+            f"@{CHALLENGER_ALIAS} names v{version} but it is not in {CHALLENGER_STAGE}; "
+            "the champion is untouched"
+        ]
+    )
     return RegistrationDecision(
         registered=moved.registered,
         model_name=name,
         version=str(version),
         stage=CHALLENGER_STAGE if moved.registered else None,
         alias=CHALLENGER_ALIAS,
-        reasons=moved.reasons,
+        reasons=[*moved.reasons, *failed],
         changed=[
             f"alias {CHALLENGER_ALIAS}",
             *([f"stage {CHALLENGER_STAGE}"] if moved.registered else []),
@@ -1099,6 +1251,12 @@ def _register_main(argv: Sequence[str]) -> int:
     A separate DAG task from evaluation on purpose: the gate decides, this
     acts, and keeping them apart means the log tells you whether a missing
     Production model is a refused candidate or a broken registry.
+
+    Exit 0: registered, and promoted or parked as the challenger as decided.
+    Exit 2: nothing registered (the gate refused it, or there is no run).
+    Exit 3 (EXIT_PROMOTION_FAILED): registered, but the alias or stage the
+    decision called for could not be written; stderr says what state the
+    registry was left in. The DAG fails the task on any non-zero exit.
     """
     # Imported inside the function: `models.train` imports `fairness.metrics`
     # and this module's gate, so pulling it in at module scope is a cycle.
@@ -1153,7 +1311,11 @@ def _register_main(argv: Sequence[str]) -> int:
         payload["alias"] = outcome.alias
         payload["promotion"] = verdict.as_dict()
         payload["promotion_reasons"] = outcome.reasons
-        if not verdict.promote:
+        payload["promotion_failed"] = not outcome.registered
+        if not outcome.registered:
+            label = "PROMOTION FAILED" if verdict.promote else "CHALLENGER NOT RECORDED"
+            print(f"\n{label}: {'; '.join(outcome.reasons)}", file=sys.stderr)
+        elif not verdict.promote:
             print(
                 f"\n{decision.model_name} v{decision.version} is registered as the "
                 f"{CHALLENGER_ALIAS}, not promoted: {'; '.join(verdict.reasons)}.\n"
@@ -1170,7 +1332,11 @@ def _register_main(argv: Sequence[str]) -> int:
     out.write_text(json.dumps(payload, indent=2))
     print(json.dumps(payload, indent=2))
 
-    return 0 if decision.registered else 2
+    if not decision.registered:
+        return 2
+    if payload.get("promotion_failed"):
+        return EXIT_PROMOTION_FAILED
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

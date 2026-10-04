@@ -11,6 +11,7 @@ same reason as `test_registry_tags.py`: the production registry is SQL-backed.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 import mlflow
 import pytest
 from mlflow.client import MlflowClient
+from mlflow.exceptions import MlflowException
 
 from credit_risk.config import settings
 from credit_risk.models import registry
@@ -83,12 +85,21 @@ def handoff(tmp_path: Path, uri: str, run_id: str, pr_auc: float) -> Path:
     return path
 
 
-def register(tmp_path: Path, uri: str, pr_auc: float, *extra: str, **run: Any) -> dict[str, Any]:
-    """`python -m credit_risk.models.registry`, in process; returns registration.json."""
+def register_with_code(
+    tmp_path: Path, uri: str, pr_auc: float, *extra: str, **run: Any
+) -> tuple[int, dict[str, Any]]:
+    """`python -m credit_risk.models.registry`, in process: (exit code, registration.json)."""
     run_id = logged_run(pr_auc, **run)
     path = handoff(tmp_path, uri, run_id, pr_auc)
-    assert registry.main(["--result", str(path), *extra]) == 0
+    code = registry.main(["--result", str(path), *extra])
     written: dict[str, Any] = json.loads((tmp_path / "registration.json").read_text())
+    return code, written
+
+
+def register(tmp_path: Path, uri: str, pr_auc: float, *extra: str, **run: Any) -> dict[str, Any]:
+    """The same, for a registration that is expected to succeed."""
+    code, written = register_with_code(tmp_path, uri, pr_auc, *extra, **run)
+    assert code == 0, written
     return written
 
 
@@ -364,6 +375,161 @@ def test_a_challenger_keeps_its_explanation_when_the_alias_cannot_be_written(
     assert outcome.registered is False
     assert version("1").tags[PROMOTION_REASON_TAG] == "pr_auc 0.5600 is 0.0400 below"
     assert version("1").current_stage == "None"
+
+
+# ------------------------------------------- unreadable is not the same as empty
+
+
+def unavailable(*args: Any, **kwargs: Any) -> Any:
+    # What the REST store raises on a 5xx, a timeout or an exhausted DB pool:
+    # an MlflowException whose code is not one of the not-found codes.
+    raise MlflowException("503 Service Unavailable: connection pool exhausted")
+
+
+class CannotRead(MlflowClient):
+    get_model_version_by_alias = unavailable
+    get_latest_versions = unavailable
+
+
+def test_an_unreadable_empty_registry_is_not_taken_for_an_empty_one(sqlite_mlflow: str) -> None:
+    # Before: every lookup error was None, None was "no champion", and the
+    # candidate was promoted over whatever the unreadable registry held.
+    verdict = compare_with_champion(logged_run(0.56), {"pr_auc": 0.56}, client=CannotRead())
+
+    assert verdict.promote is False
+    assert "could not be read" in verdict.reasons[0]
+    assert "connection pool exhausted" in verdict.reasons[0]
+
+
+def test_an_unreadable_registry_parks_the_candidate_and_leaves_the_champion_alone(
+    sqlite_mlflow: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register(tmp_path, sqlite_mlflow, 0.55)
+    monkeypatch.setattr(MlflowClient, "get_model_version_by_alias", unavailable)
+    monkeypatch.setattr(MlflowClient, "get_latest_versions", unavailable)
+
+    code, written = register_with_code(tmp_path, sqlite_mlflow, 0.70)
+    monkeypatch.undo()
+
+    # Better on paper, but nobody could check against what is serving.
+    assert code == 0
+    assert written["promoted"] is False
+    assert written["alias"] == CHALLENGER_ALIAS
+    assert alias_holder(CHAMPION) == "1"
+    assert version("1").current_stage == settings.model_stage
+    assert version("2").current_stage == CHALLENGER_STAGE
+    assert "could not be read" in version("2").tags[PROMOTION_REASON_TAG]
+
+
+def test_a_missing_alias_and_an_empty_stage_still_mean_no_champion(sqlite_mlflow: str) -> None:
+    # The not-found answers -- INVALID_PARAMETER_VALUE for the alias,
+    # RESOURCE_DOES_NOT_EXIST for the model -- are the empty registry.
+    verdict = compare_with_champion(logged_run(0.56), {"pr_auc": 0.56})
+    assert verdict.promote is True
+    assert "no champion" in verdict.reasons[0]
+
+
+def test_serving_falls_back_to_the_stage_when_the_alias_cannot_be_read_and_says_why(
+    sqlite_mlflow: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    register_if_passes(logged_run(0.56), {"pr_auc": 0.56}, FAIR_ENOUGH)
+    registry.promote("1", settings.model_stage)
+
+    class AliasDown(MlflowClient):
+        get_model_version_by_alias = unavailable
+
+    with caplog.at_level(logging.WARNING, logger=registry.logger.name):
+        found = production_version_metadata(client=AliasDown())
+
+    # Serving stays up on the stage; the reason is not swallowed.
+    assert found is not None
+    assert (found.version, found.resolved_by) == ("1", "stage")
+    assert any("connection pool exhausted" in error for error in found.resolution_errors)
+    assert "connection pool exhausted" in caplog.text
+
+
+# ------------------------------------------ a promotion that fails is a failure
+
+
+def test_a_stage_transition_that_fails_after_the_alias_moved_fails_the_command(
+    sqlite_mlflow: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register(tmp_path, sqlite_mlflow, 0.55)
+    capsys.readouterr()
+    monkeypatch.setattr(MlflowClient, "transition_model_version_stage", unavailable)
+
+    code, written = register_with_code(tmp_path, sqlite_mlflow, 0.60)
+    monkeypatch.undo()
+
+    # Non-zero, so the DAG's register_model task fails and the failure alert
+    # fires, instead of a green task over a half-promoted registry.
+    assert code == registry.EXIT_PROMOTION_FAILED
+    assert written["promoted"] is False
+    assert written["promotion_failed"] is True
+    err = capsys.readouterr().err
+    assert "PROMOTION FAILED" in err
+    # The split state, in words: the alias moved, the stage did not.
+    assert f"@{CHAMPION} now names v2" in err
+    assert alias_holder(CHAMPION) == "2"
+    assert version("1").current_stage == settings.model_stage
+    assert version("2").current_stage == "None"
+
+
+def test_set_champion_reports_a_stage_it_could_not_move(sqlite_mlflow: str) -> None:
+    register_if_passes(logged_run(0.56), {"pr_auc": 0.56}, FAIR_ENOUGH)
+
+    class StageDown(MlflowClient):
+        transition_model_version_stage = unavailable
+
+    outcome = set_champion("1", client=StageDown())
+
+    assert outcome.registered is False
+    assert outcome.changed == [f"alias {CHAMPION}"]
+    assert any("set-champion --version 1" in reason for reason in outcome.reasons)
+
+
+def test_an_alias_write_the_store_refuses_fails_the_command(
+    sqlite_mlflow: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise MlflowException("read-only replica")
+
+    monkeypatch.setattr(MlflowClient, "set_registered_model_alias", refuse)
+
+    code, written = register_with_code(tmp_path, sqlite_mlflow, 0.56)
+    monkeypatch.undo()
+
+    assert code == registry.EXIT_PROMOTION_FAILED
+    err = capsys.readouterr().err
+    assert "PROMOTION FAILED" in err
+    assert "nothing was changed" in err
+    assert alias_holder(CHAMPION) is None
+    assert version("1").current_stage == "None"
+
+
+def test_a_challenger_that_cannot_be_recorded_fails_the_command(
+    sqlite_mlflow: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register(tmp_path, sqlite_mlflow, 0.60)
+    capsys.readouterr()
+    monkeypatch.setattr(MlflowClient, "transition_model_version_stage", unavailable)
+
+    code, written = register_with_code(tmp_path, sqlite_mlflow, 0.55)
+    monkeypatch.undo()
+
+    assert code == registry.EXIT_PROMOTION_FAILED
+    assert written["promotion_failed"] is True
+    assert "CHALLENGER NOT RECORDED" in capsys.readouterr().err
+    assert alias_holder(CHAMPION) == "1"
 
 
 # ------------------------------------------------------------- contracts

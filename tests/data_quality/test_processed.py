@@ -23,6 +23,8 @@ from credit_risk.data.download import raw_meta_path
 from credit_risk.data.split import (
     BATCH_COL,
     MANIFEST_NAME,
+    QUARANTINE_FILE,
+    QUARANTINE_REASON_COL,
     SPLIT_FILES,
     SplitError,
     assign_batches,
@@ -34,7 +36,7 @@ from credit_risk.data.split import (
     split_frames,
     write_splits,
 )
-from credit_risk.data.validate import validate_clean
+from credit_risk.data.validate import DataValidationError, validate_clean
 
 
 @pytest.fixture
@@ -296,3 +298,115 @@ def test_an_unknown_origin_is_recorded_as_unknown(
 
     assert manifest["source_sha256"] is None
     assert "source_n_rows" in manifest
+
+
+# -------------------------------------------------------------- quarantine
+
+
+def _full_raw_with(
+    make_raw_frame: Callable[..., pd.DataFrame], column: str, value: int, n_bad: int
+) -> tuple[pd.DataFrame, list[int]]:
+    """30,000 raw rows with ``n_bad`` of them spread across every batch set to ``value``."""
+    raw = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+    positions = list(range(7, schema.RAW_N_ROWS, schema.RAW_N_ROWS // n_bad))[:n_bad]
+    raw.loc[positions, column] = value
+    return raw, [int(raw.loc[p, schema.ID_COL]) for p in positions]
+
+
+def _written_splits(out_dir: Path) -> dict[str, pd.DataFrame]:
+    return {name: load_split(name, out_dir) for name in SPLIT_FILES}
+
+
+def test_rows_failing_an_error_check_are_quarantined_not_trained_on(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """0.33% of the file is under the 5% tolerance, so the run goes ahead --
+    without those rows. Before this, all 100 impossible ages reached
+    train.parquet because the gate only looked at the ratio."""
+    raw, bad_ids = _full_raw_with(make_raw_frame, schema.AGE, 150, n_bad=100)
+
+    manifest = build_splits(raw, tmp_path)
+
+    splits = _written_splits(tmp_path)
+    for name, frame in splits.items():
+        assert frame[schema.AGE].max() <= schema.AGE_MAX, f"an impossible age reached {name}"
+        assert not set(frame[schema.ID_COL]) & set(bad_ids)
+    assert sum(len(frame) for frame in splits.values()) == schema.RAW_N_ROWS - 100
+
+    quarantined = pd.read_parquet(tmp_path / QUARANTINE_FILE)
+    assert sorted(quarantined[schema.ID_COL]) == sorted(bad_ids)
+    assert set(quarantined[QUARANTINE_REASON_COL]) == {"age_range"}
+    # Kept as received, so the rows can be inspected or fixed at the source.
+    assert set(quarantined[schema.AGE]) == {150}
+
+    assert manifest["quarantined_rows"] == 100
+    assert manifest["quarantine"]["n_rows"] == 100
+    assert manifest["quarantine"]["by_check"] == {"age_range": 100}
+    assert manifest["source_rows"] == schema.RAW_N_ROWS
+
+
+def test_an_undocumented_sex_code_does_not_become_a_third_group(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    raw, _ = _full_raw_with(make_raw_frame, schema.SEX, 3, n_bad=60)
+
+    manifest = build_splits(raw, tmp_path)
+
+    for frame in _written_splits(tmp_path).values():
+        assert set(frame[schema.SEX]) <= set(schema.SEX_CODES)
+    assert manifest["quarantine"]["by_check"] == {"sex_codes": 60}
+
+
+def test_quarantine_leaves_every_other_account_in_its_batch(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """A quarantined row leaves a hole in its own batch. Re-batching what is
+    left would shift the next 5,000-account boundary and quietly change the
+    membership of the held-out test set because of a typo in batch 1."""
+    raw, bad_ids = _full_raw_with(make_raw_frame, schema.LIMIT_BAL, -1, n_bad=30)
+    expected = assign_batches(clean(make_raw_frame(n_rows=schema.RAW_N_ROWS)))
+    expected = expected[~expected[schema.ID_COL].isin(bad_ids)]
+
+    build_splits(raw, tmp_path)
+
+    written = pd.concat(_written_splits(tmp_path).values())
+    batch_of = dict(zip(written[schema.ID_COL], written[BATCH_COL], strict=True))
+    assert batch_of == dict(zip(expected[schema.ID_COL], expected[BATCH_COL], strict=True))
+
+
+def test_a_clean_file_quarantines_nothing_and_hashes_exactly_as_before(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    raw = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+
+    manifest = build_splits(raw, tmp_path / "built")
+    reference = write_splits(assign_batches(clean(raw)), tmp_path / "reference")
+
+    assert manifest["quarantined_rows"] == 0
+    assert len(pd.read_parquet(tmp_path / "built" / QUARANTINE_FILE)) == 0
+    for name in SPLIT_FILES:
+        assert manifest["splits"][name]["sha256"] == reference["splits"][name]["sha256"]
+
+
+def test_a_rerun_replaces_the_previous_quarantine(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """A quarantine file left over from an earlier run would describe rows that
+    were never set aside this time."""
+    raw, _ = _full_raw_with(make_raw_frame, schema.AGE, 150, n_bad=10)
+    build_splits(raw, tmp_path)
+
+    build_splits(make_raw_frame(n_rows=schema.RAW_N_ROWS), tmp_path)
+
+    assert len(pd.read_parquet(tmp_path / QUARANTINE_FILE)) == 0
+
+
+def test_more_bad_rows_than_the_tolerance_still_stops_the_run(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    raw, _ = _full_raw_with(make_raw_frame, schema.AGE, 150, n_bad=1600)
+
+    with pytest.raises(DataValidationError, match="age_range"):
+        build_splits(raw, tmp_path)
+
+    assert not (tmp_path / QUARANTINE_FILE).exists()

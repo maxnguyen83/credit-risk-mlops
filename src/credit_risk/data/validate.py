@@ -14,7 +14,11 @@ cleaning folds them into the documented "other" bucket, so they are warnings.
 Nulls, impossible ages and negative payments are errors: they mean the file we
 received is not the file the pipeline was written against.
 
-:func:`assert_ok` turns a report into the DAG's fail-fast gate.
+:func:`assert_ok` turns a report into the DAG's fail-fast gate. Passing that
+gate does not make the bad rows good: it means there are few enough of them to
+set aside. :meth:`ValidationReport.row_failures` names the checks each row
+failed, and ``split.build_splits`` quarantines every row it names instead of
+training on it.
 
 Run it directly:
 
@@ -26,7 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -86,6 +90,10 @@ class ValidationReport:
     n_cols: int
     checks: tuple[Check, ...] = field(default_factory=tuple)
     bad_row_fraction: float = 0.0
+    # Positional masks of the rows each failed ERROR check condemns, keyed by
+    # check name. Not part of the JSON report or of equality: they are the
+    # working data the quarantine step needs, one boolean per row.
+    row_masks: Mapping[str, np.ndarray] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -99,6 +107,25 @@ class ValidationReport:
     @property
     def warnings(self) -> tuple[Check, ...]:
         return tuple(c for c in self.checks if c.severity == WARNING and not c.passed)
+
+    def bad_row_mask(self) -> np.ndarray:
+        """One boolean per row: True where any ERROR check failed.
+
+        Its mean is :attr:`bad_row_fraction`, so the rows the gate counted are
+        exactly the rows a caller sets aside.
+        """
+        mask = np.zeros(self.n_rows, dtype=bool)
+        for condemned in self.row_masks.values():
+            mask |= condemned
+        return mask
+
+    def row_failures(self) -> list[str]:
+        """Per row, the failed ERROR checks as ``"name;name"``; empty for a good row."""
+        failed: list[list[str]] = [[] for _ in range(self.n_rows)]
+        for name, condemned in self.row_masks.items():
+            for position in np.flatnonzero(condemned):
+                failed[position].append(name)
+        return [";".join(names) for names in failed]
 
     def check(self, name: str) -> Check:
         """Look one check up by name. Raises KeyError if it was never run."""
@@ -240,6 +267,7 @@ def _assemble(df: pd.DataFrame, results: Sequence[_Result]) -> ValidationReport:
     n_rows = len(df)
     bad = np.zeros(n_rows, dtype=bool)
     checks: list[Check] = []
+    row_masks: dict[str, np.ndarray] = {}
 
     for check, mask in results:
         checks.append(check)
@@ -247,7 +275,9 @@ def _assemble(df: pd.DataFrame, results: Sequence[_Result]) -> ValidationReport:
             continue
         # A failed whole-frame check (wrong columns, wrong row count) condemns
         # every row: the frame is not the shape the pipeline was written for.
-        bad |= mask if mask is not None else np.ones(n_rows, dtype=bool)
+        condemned = mask if mask is not None else np.ones(n_rows, dtype=bool)
+        row_masks[check.name] = condemned
+        bad |= condemned
 
     # An empty frame scores 1.0 rather than dividing by zero -- "no rows" is a
     # pipeline failure, not a clean bill of health.
@@ -257,6 +287,7 @@ def _assemble(df: pd.DataFrame, results: Sequence[_Result]) -> ValidationReport:
         n_cols=int(df.shape[1]),
         checks=tuple(checks),
         bad_row_fraction=fraction,
+        row_masks=row_masks,
     )
 
 
@@ -286,15 +317,25 @@ def validate_raw(df: pd.DataFrame, *, expect_full_dataset: bool = True) -> Valid
     return _assemble(df, results)
 
 
-def validate_clean(df: pd.DataFrame, *, expect_full_dataset: bool = True) -> ValidationReport:
+def validate_clean(
+    df: pd.DataFrame,
+    *,
+    expect_full_dataset: bool = True,
+    expected_rows: int | None = None,
+) -> ValidationReport:
     """Validate the frame after :func:`credit_risk.data.split.clean`.
 
     This is the contract every downstream consumer relies on, so the codes
     that were merely warnings on the raw frame are hard errors here.
+
+    ``expected_rows`` defaults to the full file. The splitter passes the full
+    file minus what it quarantined, so a run that set rows aside is checked
+    against the count it should have kept, not failed for keeping fewer.
     """
     expected = (*schema.CLEAN_COLUMNS, schema.AGE_GROUP)
+    want = schema.RAW_N_ROWS if expected_rows is None else expected_rows
     results: list[_Result] = [
-        _check_row_count(df, schema.RAW_N_ROWS, expect_full_dataset),
+        _check_row_count(df, want, expect_full_dataset),
         # BATCH_COL is added after cleaning; tolerate it so the same report
         # can be run on a split frame without a spurious "unexpected column".
         _check_columns(df, expected, optional=(BATCH_COL,)),
@@ -321,6 +362,10 @@ def assert_ok(report: ValidationReport, *, context: str = "dataset") -> None:
     The DAG calls this instead of inspecting the report itself: the decision
     "how bad is too bad" belongs in one place, next to the threshold, and the
     answer is schema.MAX_BAD_ROW_FRACTION.
+
+    Returning means "few enough to set aside", not "nothing wrong": the rows
+    behind a failed check are still bad, and the caller must drop them
+    (``split.build_splits`` quarantines them) rather than train on them.
     """
     if report.bad_row_fraction <= schema.MAX_BAD_ROW_FRACTION:
         return
@@ -339,7 +384,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     inside ``split.build_splits``, because a red *validate_raw* task names the
     problem where an operator will look for it. Exit code 1 means the frame is
     too damaged to train on; the report is on stdout either way, so a run that
-    fails still leaves the evidence behind.
+    fails still leaves the evidence behind. Exit 0 with failed checks in the
+    report means the damage is under the tolerance: ``clean_and_split`` sets
+    those rows aside in ``quarantine.parquet`` rather than training on them.
     """
     # Imported here, not at module scope: download.py pulls in `requests`, and
     # this module is on the import path of every training and serving process.
@@ -362,6 +409,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = validate_raw(load_raw(source), expect_full_dataset=not args.allow_partial)
     for warning in report.warnings:
         log.warning("data warning %s: %s", warning.name, warning.detail)
+    for failure in report.failures:
+        log.warning("data error %s: %s", failure.name, failure.detail)
 
     # stdout is the contract for subprocess callers; logs go to stderr.
     print(json.dumps(report.to_dict(), indent=2))

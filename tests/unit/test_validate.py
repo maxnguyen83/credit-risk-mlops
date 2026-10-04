@@ -119,6 +119,25 @@ def test_assert_ok_tolerates_a_defect_below_the_threshold(
     assert_ok(report)  # 0.5% is under MAX_BAD_ROW_FRACTION
 
 
+def test_the_report_names_the_rows_it_counted_and_why(synthetic_raw_df: pd.DataFrame) -> None:
+    """The gate's ratio and the rows a caller sets aside must be the same rows."""
+    synthetic_raw_df.loc[3, schema.AGE] = 200
+    synthetic_raw_df.loc[3, schema.SEX] = 3
+    synthetic_raw_df.loc[9, schema.LIMIT_BAL] = 0
+    report = validate_raw(synthetic_raw_df, expect_full_dataset=False)
+
+    mask = report.bad_row_mask()
+    assert list(np.flatnonzero(mask)) == [3, 9]
+    assert mask.mean() == pytest.approx(report.bad_row_fraction)
+    failures = report.row_failures()
+    assert failures[3] == "age_range;sex_codes"
+    assert failures[9] == "limit_bal_positive"
+    assert sum(1 for reasons in failures if reasons) == 2
+    # Warnings are not errors and never put a row aside: rows 0-3 carry the
+    # undocumented EDUCATION/MARRIAGE codes and only row 3 is listed.
+    assert failures[0] == ""
+
+
 def test_assert_ok_raises_above_the_threshold(synthetic_raw_df: pd.DataFrame) -> None:
     n_bad = int(SAMPLE_ROWS * (schema.MAX_BAD_ROW_FRACTION + 0.05))
     synthetic_raw_df.loc[: n_bad - 1, schema.AGE] = 200

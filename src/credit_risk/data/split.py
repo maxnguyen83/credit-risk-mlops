@@ -10,6 +10,18 @@ Determinism is the point. Every split carries a content hash in
 ``splits_manifest.json``, so "did the data change or did the model change?" is
 a question with an answer rather than an argument.
 
+Rows that fail an error-level check are not trained on. Up to
+``schema.MAX_BAD_ROW_FRACTION`` of the file may fail and the run still goes
+ahead -- without those rows: they are written, as received, to
+``quarantine.parquet`` with the checks they failed, and the manifest counts
+them. Batches are assigned before anything is set aside, so a quarantined row
+leaves a hole in its own batch instead of shifting every later account into an
+earlier one.
+
+Batches are cut by ``ID``, and ``ID`` is not time: the default rate differs
+between splits (22.8% train, 20.4% test, 21.2% serving pool on the published
+file). DATASHEET.md records this as a known property of the simulation.
+
 Run it directly:
 
     python -m credit_risk.data.split
@@ -32,7 +44,13 @@ import pandas as pd
 from credit_risk import schema
 from credit_risk.config import settings
 from credit_risk.data.download import load_raw, load_raw_metadata, raw_parquet_path
-from credit_risk.data.validate import BATCH_COL, assert_ok, validate_clean, validate_raw
+from credit_risk.data.validate import (
+    BATCH_COL,
+    ValidationReport,
+    assert_ok,
+    validate_clean,
+    validate_raw,
+)
 from credit_risk.features.build import normalize_codes
 
 log = logging.getLogger(__name__)
@@ -43,6 +61,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "BATCH_COL",
     "MANIFEST_NAME",
+    "QUARANTINE_FILE",
+    "QUARANTINE_REASON_COL",
     "SPLIT_BATCHES",
     "SPLIT_FILES",
     "SplitError",
@@ -52,11 +72,19 @@ __all__ = [
     "frame_sha256",
     "load_split",
     "main",
+    "quarantine_rows",
     "split_frames",
     "write_splits",
 ]
 
 MANIFEST_NAME: Final = "splits_manifest.json"
+
+# Rows set aside by build_splits, written next to the splits on every run --
+# empty when nothing failed, so a file left over from an earlier run never
+# describes rows this run did not set aside.
+QUARANTINE_FILE: Final = "quarantine.parquet"
+# The error checks a quarantined row failed, ";"-joined.
+QUARANTINE_REASON_COL: Final = "quarantine_reason"
 
 SPLIT_FILES: Final[dict[str, str]] = {
     "train": "train.parquet",
@@ -146,12 +174,47 @@ def split_frames(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+def quarantine_rows(
+    raw: pd.DataFrame, report: ValidationReport
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Batch the raw frame, then split it into (kept, quarantined).
+
+    ``report`` must be ``validate_raw`` of this very frame: its row masks are
+    positional. Batches are assigned first, over every row, so the accounts
+    that are kept stay in the batch they arrived in. The quarantined rows keep
+    their raw values plus the batch and the checks they failed.
+    """
+    if report.n_rows != len(raw):
+        raise ValueError(f"report covers {report.n_rows} rows, frame has {len(raw)}")
+    flagged = raw.assign(**{QUARANTINE_REASON_COL: report.row_failures()})
+    batched = assign_batches(flagged)
+    bad = (batched[QUARANTINE_REASON_COL] != "").to_numpy()
+    quarantined = batched.loc[bad].reset_index(drop=True)
+    kept = batched.loc[~bad].drop(columns=QUARANTINE_REASON_COL).reset_index(drop=True)
+    return kept, quarantined
+
+
+def _empty_quarantine() -> pd.DataFrame:
+    columns = [*schema.RAW_COLUMNS, BATCH_COL, QUARANTINE_REASON_COL]
+    return pd.DataFrame({column: pd.Series(dtype="object") for column in columns})
+
+
+def _quarantine_counts(quarantined: pd.DataFrame) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for reasons in quarantined.get(QUARANTINE_REASON_COL, pd.Series(dtype="object")):
+        for name in str(reasons).split(";"):
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def write_splits(
     df: pd.DataFrame,
     out_dir: Path | None = None,
     *,
     source: Mapping[str, Any] | None = None,
     allow_empty_splits: bool = False,
+    quarantined: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Write the three splits plus a manifest, and return the manifest.
 
@@ -161,6 +224,10 @@ def write_splits(
     ``source`` is the download's provenance sidecar; its digest is copied into
     the manifest so the two questions "did the data change?" and "did the model
     change?" can be told apart from the files alone.
+
+    ``quarantined`` holds the rows :func:`build_splits` set aside. They are
+    written to :data:`QUARANTINE_FILE` and counted in the manifest; ``None``
+    writes an empty quarantine, so the file always describes this run.
 
     An empty split raises unless ``allow_empty_splits`` is set. It is reachable
     without one: ``assign_batches`` clips at :data:`schema.N_BATCHES`, so a
@@ -173,9 +240,11 @@ def write_splits(
 
     frames = split_frames(df)
     provenance = dict(source or {})
+    held = _empty_quarantine() if quarantined is None else quarantined
     manifest: dict[str, Any] = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "source_rows": int(len(df)),
+        # Rows received: the ones split below plus the ones set aside.
+        "source_rows": int(len(df) + len(held)),
         # None rather than absent when the sidecar is missing: a null reads as
         # "origin unknown", a missing key reads as "nobody thought about it".
         "source_sha256": provenance.get("sha256"),
@@ -184,6 +253,7 @@ def write_splits(
         "batch_size": schema.BATCH_SIZE,
         "degraded": False,
         "empty_splits": [],
+        "quarantined_rows": int(len(held)),
         "splits": {},
     }
 
@@ -217,6 +287,23 @@ def write_splits(
         }
         log.info("wrote %s (%d rows)", path, len(frame))
 
+    quarantine_path = target_dir / QUARANTINE_FILE
+    held.to_parquet(quarantine_path, index=False)
+    manifest["quarantine"] = {
+        "path": str(quarantine_path),
+        "file": QUARANTINE_FILE,
+        "n_rows": int(len(held)),
+        "by_check": _quarantine_counts(held),
+        "sha256": frame_sha256(held),
+    }
+    if len(held):
+        log.warning(
+            "quarantined %d rows that failed validation (%s); see %s",
+            len(held),
+            manifest["quarantine"]["by_check"],
+            quarantine_path,
+        )
+
     (target_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -239,24 +326,39 @@ def build_splits(
     expect_full_dataset: bool = True,
     raw_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate, clean, batch and write in one call. Used by the DAG and the CLI.
+    """Validate, quarantine, clean, batch and write in one call. Used by the DAG and the CLI.
+
+    More than ``schema.MAX_BAD_ROW_FRACTION`` of rows failing an error check
+    stops the run. Fewer than that are quarantined: batched with everyone
+    else, then set aside before cleaning, so not one of them reaches a split.
 
     ``raw_path`` only says where to look for the provenance sidecar; the frame
     itself is the one passed in. Sampling mode (``expect_full_dataset=False``)
     also permits empty splits, because a sample short enough to skip the
     30,000-row assertion is a sample too short to fill six batches.
     """
-    assert_ok(validate_raw(raw, expect_full_dataset=expect_full_dataset), context="raw dataset")
-    cleaned = clean(raw)
+    report = validate_raw(raw, expect_full_dataset=expect_full_dataset)
+    assert_ok(report, context="raw dataset")
+    kept, quarantined = quarantine_rows(raw, report)
+
+    # clean() returns the published column set, which has no batch column; the
+    # batch kept was assigned over the whole file and is put back by position.
+    cleaned = clean(kept)
+    cleaned[BATCH_COL] = kept[BATCH_COL].to_numpy()
     assert_ok(
-        validate_clean(cleaned, expect_full_dataset=expect_full_dataset),
+        validate_clean(
+            cleaned,
+            expect_full_dataset=expect_full_dataset,
+            expected_rows=schema.RAW_N_ROWS - len(quarantined),
+        ),
         context="cleaned dataset",
     )
     return write_splits(
-        assign_batches(cleaned),
+        cleaned,
         out_dir,
         source=load_raw_metadata(raw_path),
         allow_empty_splits=not expect_full_dataset,
+        quarantined=quarantined,
     )
 
 

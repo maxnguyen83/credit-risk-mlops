@@ -315,7 +315,8 @@ def describe(args: argparse.Namespace, source: str, url: str) -> None:
     if args.drift:
         modes.append(f"drift={args.drift}sigma -> FeatureDriftHigh")
     if args.bias:
-        modes.append(f"bias={args.bias:.0%} SEX=1 -> FairnessGapExceeded")
+        # The arrival mix moves, not a within-group rate: see the docstring.
+        modes.append(f"bias={args.bias:.0%} SEX=1 -> no alert, watch the per-group rates")
     if args.slow:
         modes.append(f"slow batches of {args.batch_size} -> SlowBatchPredictions")
     print(f"  target : {url}")

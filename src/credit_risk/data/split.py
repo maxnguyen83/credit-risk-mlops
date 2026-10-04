@@ -10,7 +10,8 @@ Determinism is the point. Every split carries a content hash in
 ``splits_manifest.json``, so "did the data change or did the model change?" is
 a question with an answer rather than an argument.
 
-Rows that fail an error-level check are not trained on. Up to
+Rows that fail an error-level check -- of the raw frame, or of the cleaned
+frame (a category code the folds cannot fix) -- are not trained on. Up to
 ``schema.MAX_BAD_ROW_FRACTION`` of the file may fail and the run still goes
 ahead -- without those rows: they are written, as received, to
 ``quarantine.parquet`` with the checks they failed, and the manifest counts
@@ -46,6 +47,7 @@ from credit_risk.config import settings
 from credit_risk.data.download import load_raw, load_raw_metadata, raw_parquet_path
 from credit_risk.data.validate import (
     BATCH_COL,
+    DataValidationError,
     ValidationReport,
     assert_ok,
     validate_clean,
@@ -83,8 +85,11 @@ MANIFEST_NAME: Final = "splits_manifest.json"
 # empty when nothing failed, so a file left over from an earlier run never
 # describes rows this run did not set aside.
 QUARANTINE_FILE: Final = "quarantine.parquet"
-# The error checks a quarantined row failed, ";"-joined.
+# The error checks a quarantined row failed, ";"-joined. Checks of the cleaned
+# frame carry CLEAN_CHECK_PREFIX, so "education_codes" (a raw check) and
+# "clean:education_codes" (the same code, still invalid after folding) differ.
 QUARANTINE_REASON_COL: Final = "quarantine_reason"
+CLEAN_CHECK_PREFIX: Final = "clean:"
 
 SPLIT_FILES: Final[dict[str, str]] = {
     "train": "train.parquet",
@@ -192,6 +197,31 @@ def quarantine_rows(
     quarantined = batched.loc[bad].reset_index(drop=True)
     kept = batched.loc[~bad].drop(columns=QUARANTINE_REASON_COL).reset_index(drop=True)
     return kept, quarantined
+
+
+def _reject_cleaned(
+    kept: pd.DataFrame, cleaned: pd.DataFrame, report: ValidationReport
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Set aside the rows the cleaned-frame contract rejects.
+
+    Some defects only show after cleaning: EDUCATION=7 is a raw *warning*,
+    because the fold might fix it, and an *error* once the fold has left it
+    alone. ``cleaned`` is ``kept`` cleaned row for row, so the report's
+    positional mask selects the same accounts in both; the quarantined copy is
+    taken from ``kept``, as received. Returns (kept, cleaned, quarantined).
+    """
+    rejected = report.bad_row_mask()
+    reasons = [
+        ";".join(f"{CLEAN_CHECK_PREFIX}{name}" for name in failed.split(";"))
+        for failed, bad in zip(report.row_failures(), rejected, strict=True)
+        if bad
+    ]
+    quarantined = kept.loc[rejected].assign(**{QUARANTINE_REASON_COL: reasons})
+    return (
+        kept.loc[~rejected].reset_index(drop=True),
+        cleaned.loc[~rejected].reset_index(drop=True),
+        quarantined.reset_index(drop=True),
+    )
 
 
 def _empty_quarantine() -> pd.DataFrame:
@@ -328,31 +358,60 @@ def build_splits(
 ) -> dict[str, Any]:
     """Validate, quarantine, clean, batch and write in one call. Used by the DAG and the CLI.
 
-    More than ``schema.MAX_BAD_ROW_FRACTION`` of rows failing an error check
-    stops the run. Fewer than that are quarantined: batched with everyone
-    else, then set aside before cleaning, so not one of them reaches a split.
+    A row that fails an error check -- of the raw frame, or of the cleaned
+    frame (a code the folds cannot fix) -- never reaches a split. Batches are
+    assigned over the whole file first; the failing rows are then written to
+    :data:`QUARANTINE_FILE` as received and counted in the manifest. If more
+    than ``schema.MAX_BAD_ROW_FRACTION`` of the file fails, across both stages,
+    the run stops instead. The frame that is written is re-validated and must
+    pass every error check.
 
     ``raw_path`` only says where to look for the provenance sidecar; the frame
     itself is the one passed in. Sampling mode (``expect_full_dataset=False``)
     also permits empty splits, because a sample short enough to skip the
     30,000-row assertion is a sample too short to fill six batches.
     """
-    report = validate_raw(raw, expect_full_dataset=expect_full_dataset)
-    assert_ok(report, context="raw dataset")
-    kept, quarantined = quarantine_rows(raw, report)
+    raw_report = validate_raw(raw, expect_full_dataset=expect_full_dataset)
+    assert_ok(raw_report, context="raw dataset")
+    kept, quarantined = quarantine_rows(raw, raw_report)
 
     # clean() returns the published column set, which has no batch column; the
     # batch kept was assigned over the whole file and is put back by position.
     cleaned = clean(kept)
     cleaned[BATCH_COL] = kept[BATCH_COL].to_numpy()
-    assert_ok(
-        validate_clean(
-            cleaned,
-            expect_full_dataset=expect_full_dataset,
-            expected_rows=schema.RAW_N_ROWS - len(quarantined),
-        ),
-        context="cleaned dataset",
+    clean_report = validate_clean(
+        cleaned,
+        expect_full_dataset=expect_full_dataset,
+        expected_rows=schema.RAW_N_ROWS - len(quarantined),
     )
+    # A whole-frame failure condemns every row and stops the run here.
+    assert_ok(clean_report, context="cleaned dataset")
+    kept, cleaned, late = _reject_cleaned(kept, cleaned, clean_report)
+    if len(late):
+        quarantined = (
+            pd.concat([quarantined, late[quarantined.columns]], ignore_index=True)
+            .sort_values(schema.ID_COL, kind="mergesort")
+            .reset_index(drop=True)
+        )
+
+    # The tolerance is about the file: 4% rejected raw and 4% rejected after
+    # cleaning is 8% of the accounts gone, whichever stage caught them.
+    set_aside = len(quarantined) / len(raw) if len(raw) else 1.0
+    if set_aside > schema.MAX_BAD_ROW_FRACTION:
+        raise DataValidationError(
+            f"{len(quarantined)} of {len(raw)} rows ({set_aside:.1%}) failed the raw or "
+            f"the cleaned checks, above the {schema.MAX_BAD_ROW_FRACTION:.0%} tolerance. "
+            f"Failing checks: {_quarantine_counts(quarantined)}"
+        )
+
+    final = validate_clean(
+        cleaned,
+        expect_full_dataset=expect_full_dataset,
+        expected_rows=schema.RAW_N_ROWS - len(quarantined),
+    )
+    if not final.ok:
+        named = ", ".join(f"{c.name} ({c.n_bad_rows} rows)" for c in final.failures)
+        raise DataValidationError(f"cleaned dataset still fails after quarantine: {named}")
     return write_splits(
         cleaned,
         out_dir,

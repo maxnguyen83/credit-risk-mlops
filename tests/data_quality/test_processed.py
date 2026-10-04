@@ -410,3 +410,44 @@ def test_more_bad_rows_than_the_tolerance_still_stops_the_run(
         build_splits(raw, tmp_path)
 
     assert not (tmp_path / QUARANTINE_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    ("column", "code", "check"),
+    [(schema.EDUCATION, 7, "education_codes"), (schema.MARRIAGE, 9, "marriage_codes")],
+)
+def test_a_code_cleaning_cannot_fold_is_quarantined_too(
+    make_raw_frame: Callable[..., pd.DataFrame],
+    tmp_path: Path,
+    column: str,
+    code: int,
+    check: str,
+) -> None:
+    """EDUCATION=7 is only a warning on the raw frame (the folds might fix it),
+    survives the fold (it is not 0/5/6), and fails the cleaned-frame contract.
+    Checking that contract with the 5% ratio alone let all 60 rows into train."""
+    raw, bad_ids = _full_raw_with(make_raw_frame, column, code, n_bad=60)
+
+    manifest = build_splits(raw, tmp_path)
+
+    for frame in _written_splits(tmp_path).values():
+        assert code not in set(frame[column])
+    quarantined = pd.read_parquet(tmp_path / QUARANTINE_FILE)
+    assert sorted(quarantined[schema.ID_COL]) == sorted(bad_ids)
+    assert set(quarantined[QUARANTINE_REASON_COL]) == {f"clean:{check}"}
+    assert set(quarantined[column]) == {code}, "kept as received, not as cleaned"
+    assert manifest["quarantined_rows"] == 60
+    assert manifest["quarantine"]["by_check"] == {f"clean:{check}": 60}
+
+
+def test_raw_and_clean_rejections_share_one_tolerance(
+    make_raw_frame: Callable[..., pd.DataFrame], tmp_path: Path
+) -> None:
+    """4% impossible ages and 4% unfoldable codes are each under 5%, and 8%
+    of the file together. The tolerance is about the file, not each stage."""
+    raw = make_raw_frame(n_rows=schema.RAW_N_ROWS)
+    raw.loc[raw.index[0:1200], schema.AGE] = 150
+    raw.loc[raw.index[1200:2400], schema.EDUCATION] = 7
+
+    with pytest.raises(DataValidationError, match="8.0%"):
+        build_splits(raw, tmp_path)

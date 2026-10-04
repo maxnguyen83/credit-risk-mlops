@@ -8,7 +8,7 @@ Each records the context, what we chose, what we rejected, why, and the price.
 | [0001](./0001-modular-monolith-api.md) | Modular monolith for the API, not microservices |
 | [0002](./0002-batch-not-streaming.md) | Batch scoring, not streaming |
 | [0003](./0003-registry-as-source-of-truth.md) | MLflow Registry is the source of truth for the served model |
-| [0004](./0004-postgres-objectstore-behind-mlflow.md) | Postgres and MinIO behind MLflow, not SQLite and a folder |
+| [0004](./0004-postgres-objectstore-behind-mlflow.md) | Postgres and an S3 object store (SeaweedFS) behind MLflow, not SQLite and a folder |
 | [0005](./0005-airflow-standalone.md) | Airflow standalone in one container, not CeleryExecutor |
 | [0006](./0006-two-interpreters-in-airflow-image.md) | Two Python interpreters inside the Airflow image |
 | [0007](./0007-lightgbm-with-logistic-baseline.md) | LightGBM as the candidate, logistic regression as the baseline |

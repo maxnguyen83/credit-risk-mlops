@@ -1,0 +1,285 @@
+# The whole system, in one file.
+#
+#   cp .env.example .env && docker compose up -d --build
+#   docker compose ps                     # wait for healthy
+#   make data && make train               # populate the registry
+#   make smoke                            # prove it answers correctly
+#
+#   API + Swagger  http://127.0.0.1:18000/docs
+#   MLflow         http://127.0.0.1:15020
+#   Airflow        http://127.0.0.1:18081
+#   Prometheus     http://127.0.0.1:19090
+#   Alertmanager   http://127.0.0.1:19093
+#   Grafana        http://127.0.0.1:13000      (anonymous viewer)
+#   Object store   http://127.0.0.1:19011      (SeaweedFS filer)
+#
+# Ports are in the 1xxxx range because four lab stacks already own the usual
+# ones on a machine that has been through this course. Nothing here needs a
+# privileged port.
+
+name: ddm501-credit-risk
+
+# MLflow and the API both reach the object store (SeaweedFS) through boto3, so
+# they need the same four variables. Defined once, anchored, reused.
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_DEFAULT_REGION: us-east-1
+  MLFLOW_S3_ENDPOINT_URL: http://objectstore:8333
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: credit-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # An open port is not a database ready to accept connections: Postgres
+      # starts, runs initdb, restarts itself, and only then listens for real.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  objectstore:
+    # SeaweedFS, not MinIO, and the reason is distribution rather than
+    # engineering. MinIO's community images are gone: `minio/minio` on Docker
+    # Hub denies anonymous pulls and quay.io/minio/minio now requires auth for
+    # every tag. A stack whose object store cannot be pulled on a clean runner
+    # is a stack that only works on the machine that already cached it -- which
+    # is exactly how CI found this, and how a marker would have found it too.
+    #
+    # SeaweedFS speaks the same S3 API, so nothing above it changes: boto3,
+    # MLflow's --default-artifact-root and the bucket job are untouched.
+    image: chrislusf/seaweedfs:3.80
+    container_name: credit-objectstore
+    command: server -dir=/data -s3 -s3.port=8333 -ip=0.0.0.0 -master.volumeSizeLimitMB=256
+    ports:
+      - "19010:8333"   # S3 API
+      - "19011:8888"   # filer browser, the nearest thing to the MinIO console
+    volumes:
+      - objectstore-data:/data
+    healthcheck:
+      # The S3 port answering is the thing MLflow depends on; the master and
+      # volume servers come up before it.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8333"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 15s
+    restart: unless-stopped
+
+  createbucket:
+    # Reuses the MLflow image rather than pulling a second client image:
+    # boto3 is already in there, and one fewer image is one fewer thing that can
+    # fail to pull on a marking machine. Runs once and exits; mlflow waits for
+    # it to exit zero.
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    image: credit-risk-mlflow:2.19.0
+    container_name: credit-createbucket
+    depends_on:
+      objectstore:
+        condition: service_healthy
+    environment:
+      <<: *s3-env
+      MLFLOW_BUCKET: ${MLFLOW_BUCKET}
+    command:
+      - python
+      - -c
+      - |
+        import os, boto3, botocore
+        bucket = os.environ["MLFLOW_BUCKET"]
+        s3 = boto3.client("s3", endpoint_url=os.environ["MLFLOW_S3_ENDPOINT_URL"])
+        try:
+            s3.head_bucket(Bucket=bucket)
+            print(f"bucket {bucket} already exists")
+        except botocore.exceptions.ClientError:
+            s3.create_bucket(Bucket=bucket)
+            print(f"created bucket {bucket}")
+    restart: "no"
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    image: credit-risk-mlflow:2.19.0
+    container_name: credit-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        # "finished successfully", not "started". The first log_model fails on a
+        # missing bucket, and it fails after the model has already trained.
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - --default-artifact-root
+      - s3://${MLFLOW_BUCKET}/
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+    ports:
+      - "15020:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+
+  credit-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: credit-risk-api:0.1.0
+    container_name: credit-api
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *s3-env
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME}
+      MODEL_STAGE: ${MODEL_STAGE}
+      # Served first; MODEL_STAGE is the fallback. Defaulted for an older .env.
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      THRESHOLD_POLICY: ${THRESHOLD_POLICY}
+      # Defaulted, so an .env written before this variable existed still boots.
+      THRESHOLD_SOURCE: ${THRESHOLD_SOURCE:-registry}
+      DECISION_THRESHOLD: ${DECISION_THRESHOLD}
+      GIT_SHA: ${GIT_SHA:-unknown}
+      # The package is installed into site-packages, so PROJECT_ROOT cannot be
+      # inferred from __file__ the way it can in a source checkout. Point the
+      # data paths at the mount explicitly rather than letting them resolve to
+      # somewhere inside the virtualenv.
+      DATA_DIR: /app/data
+      RAW_DIR: /app/data/raw
+      PROCESSED_DIR: /app/data/processed
+    volumes:
+      # Read-only, and only for LIME's background sample and the group
+      # thresholds. Serving reads no other file.
+      #
+      # This is the weakest seam in the design: a serving container that needs a
+      # file from the training host is a container that behaves differently on
+      # another machine. The right fix is to log the background sample as an
+      # MLflow artifact alongside the model so it travels with the version --
+      # recorded in ARCHITECTURE.md section 7 rather than hidden here.
+      - ./data:/app/data:ro
+    ports:
+      - "18000:8000"
+    restart: unless-stopped
+
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: credit-risk-airflow:2.8.4
+    container_name: credit-airflow
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: standalone
+    environment:
+      <<: *s3-env
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME}
+      # register_model compares with the version this alias names and promotes
+      # within this PR-AUC tolerance of it. Defaulted for an older .env.
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      PROMOTION_PR_AUC_TOLERANCE: ${PROMOTION_PR_AUC_TOLERANCE:-0.005}
+      # Written onto every model version register_model creates (git_sha tag).
+      GIT_SHA: ${GIT_SHA:-unknown}
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - airflow-logs:/opt/airflow/logs
+    ports:
+      - "18081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: credit-prometheus
+    depends_on:
+      - credit-api
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "19090:9090"
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: credit-alertmanager
+    # Starts on the no-op config unless a Telegram bot token and chat id are in
+    # the secrets mount below; anything incomplete falls back to it, logged.
+    # No secret is needed to start. Turning delivery on: docs/ALERTING.md.
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      # Files, not environment variables: Alertmanager reads the token itself
+      # and nothing secret shows up in `docker inspect`. Gitignored by default;
+      # set an absolute path in .env to keep the files outside the checkout.
+      - ${ALERTMANAGER_SECRETS_DIR:-./monitoring/alertmanager/secrets}:/run/secrets/alertmanager:ro
+    ports:
+      - "19093:9093"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: credit-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "13000:3000"
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  objectstore-data:
+  prometheus-data:
+  grafana-data:
+  airflow-logs:

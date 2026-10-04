@@ -1,0 +1,37 @@
+# Build context for Dockerfile, Dockerfile.airflow and Dockerfile.mlflow.
+#
+# Between them the three images COPY only pyproject.toml, README.md, src/ and
+# scripts/. Without this file `docker build .` also ships the local virtualenv,
+# the git history, the dataset, the MLflow store and .env to the daemon on every
+# build -- over a gigabyte of context, one of which is a file of secrets.
+# Nothing below may be something a Dockerfile COPYs.
+
+# secrets
+.env
+monitoring/alertmanager/secrets/
+
+# local environments and history
+.venv/
+.git/
+
+# data and service state
+data/
+mlruns/
+pg-data/
+minio-data/
+logs/
+
+# test, lint and type-check output
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# bytecode and build leftovers
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+.DS_Store

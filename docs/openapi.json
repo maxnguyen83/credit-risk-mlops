@@ -1,0 +1,1362 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Credit Default Early-Warning API",
+    "description": "Early-warning scoring for an existing credit-card portfolio. Ranks accounts for the monthly intervention list; it does not approve or decline anyone, and a human makes the final call on every account it flags.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Health, plus which model is answering",
+        "description": "Report the served model, not merely that the port is open.\n\n`model_ref` says whether that model was found through the champion alias or\nthrough the stage fallback, so \"I set the alias, is it live?\" has an answer\nhere rather than in the logs.\n\nReturns 200 even when degraded, on purpose: a 503 here puts the container\ninto a restart loop that destroys the very logs explaining the problem.\n`credit_model_loaded == 0` and the ModelNotLoaded alert are what wake\nsomeone up; this endpoint's job is to say why.\n\nIt also says which cutoff decisions are made at and where it came from.\n`threshold_source: \"fallback\"` is a working service deciding at a configured\nconstant because the loaded version carries no threshold tag.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "Prometheus exposition",
+        "description": "Hand the registry straight to Prometheus.",
+        "operationId": "metrics_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/version": {
+      "get": {
+        "tags": [
+          "ops"
+        ],
+        "summary": "What is deployed right now",
+        "description": "API build and model build in one place, for incident reviews.",
+        "operationId": "version_version_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/predict": {
+      "post": {
+        "tags": [
+          "inference"
+        ],
+        "summary": "Score one account for default next month",
+        "description": "Score a single account and return the decision with its policy.",
+        "operationId": "predict_api_v1_predict_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditApplication"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PredictResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The record did not match the schema.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected failure; see request_id in the logs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No model is loaded; the service is degraded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/predict/batch": {
+      "post": {
+        "tags": [
+          "inference"
+        ],
+        "summary": "Score a portfolio slice in one call",
+        "description": "Score up to `max_batch_size` accounts; the nightly core-banking path.",
+        "operationId": "predict_batch_api_v1_predict_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchPredictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchPredictResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The record did not match the schema.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected failure; see request_id in the logs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No model is loaded; the service is degraded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explain": {
+      "post": {
+        "tags": [
+          "inference"
+        ],
+        "summary": "SHAP and LIME reasons behind one score",
+        "description": "Explain one decision with both methods and state how far they agree.",
+        "operationId": "explain_api_v1_explain_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreditApplication"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExplainResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The record did not match the schema.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected failure; see request_id in the logs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No model is loaded; the service is degraded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fairness/report": {
+      "get": {
+        "tags": [
+          "responsible-ai"
+        ],
+        "summary": "Fairness of the model that is serving right now",
+        "description": "Live selection rates per protected group, against the registration gates.",
+        "operationId": "fairness_report_api_v1_fairness_report_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FairnessReportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The record did not match the schema.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected failure; see request_id in the logs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No model is loaded; the service is degraded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Agreement": {
+        "properties": {
+          "top3_overlap": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Top3 Overlap",
+            "description": "Shared features among each method's top 3."
+          },
+          "note": {
+            "type": "string",
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "required": [
+          "top3_overlap",
+          "note"
+        ],
+        "title": "Agreement",
+        "description": "How far the two explainers tell the same story."
+      },
+      "BatchPredictRequest": {
+        "properties": {
+          "applications": {
+            "items": {
+              "$ref": "#/components/schemas/CreditApplication"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Applications",
+            "description": "Up to 1000 accounts. The cap is enforced here so an oversized batch fails fast at validation instead of after the features have been built."
+          }
+        },
+        "type": "object",
+        "required": [
+          "applications"
+        ],
+        "title": "BatchPredictRequest",
+        "description": "A nightly portfolio slice.",
+        "examples": [
+          {
+            "applications": [
+              {
+                "AGE": 39,
+                "BILL_AMT1": 113500.0,
+                "BILL_AMT2": 110200.0,
+                "BILL_AMT3": 107800.0,
+                "BILL_AMT4": 104300.0,
+                "BILL_AMT5": 99900.0,
+                "BILL_AMT6": 95100.0,
+                "EDUCATION": 2,
+                "LIMIT_BAL": 120000.0,
+                "MARRIAGE": 1,
+                "PAY_1": 2,
+                "PAY_2": 2,
+                "PAY_3": 0,
+                "PAY_4": 0,
+                "PAY_5": 0,
+                "PAY_6": 0,
+                "PAY_AMT1": 0.0,
+                "PAY_AMT2": 4000.0,
+                "PAY_AMT3": 3800.0,
+                "PAY_AMT4": 5000.0,
+                "PAY_AMT5": 4500.0,
+                "PAY_AMT6": 4200.0,
+                "SEX": 2,
+                "account_id": "A-10023"
+              }
+            ]
+          }
+        ]
+      },
+      "BatchPredictResponse": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "intervene_count": {
+            "type": "integer",
+            "title": "Intervene Count",
+            "description": "How many accounts crossed the threshold."
+          },
+          "high_risk_count": {
+            "type": "integer",
+            "title": "High Risk Count",
+            "description": "How many landed in the 'high' band."
+          },
+          "predictions": {
+            "items": {
+              "$ref": "#/components/schemas/PredictResponse"
+            },
+            "type": "array",
+            "title": "Predictions"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "served_at": {
+            "type": "string",
+            "title": "Served At"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count",
+          "intervene_count",
+          "high_risk_count",
+          "predictions",
+          "model_name",
+          "model_version",
+          "request_id"
+        ],
+        "title": "BatchPredictResponse",
+        "description": "Scores for the slice, plus the two counts the risk desk actually reads."
+      },
+      "CreditApplication": {
+        "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Id",
+            "description": "Opaque account reference, echoed back on the response. Never a model feature and never a metric label."
+          },
+          "LIMIT_BAL": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Limit Bal",
+            "description": "Approved credit limit in NT$, including any supplementary cards."
+          },
+          "SEX": {
+            "type": "integer",
+            "maximum": 2.0,
+            "minimum": 1.0,
+            "title": "Sex",
+            "description": "1 = male, 2 = female. Protected attribute: measured and monitored, never offered as a reason for a decision."
+          },
+          "EDUCATION": {
+            "type": "integer",
+            "maximum": 6.0,
+            "minimum": 0.0,
+            "title": "Education",
+            "description": "1 = graduate school, 2 = university, 3 = high school, 4 = other. Codes 0, 5 and 6 occur in the source extract and are folded into 'other'."
+          },
+          "MARRIAGE": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Marriage",
+            "description": "1 = married, 2 = single, 3 = other. Code 0 occurs in the source extract and is folded into 'other'."
+          },
+          "AGE": {
+            "type": "integer",
+            "maximum": 79.0,
+            "minimum": 21.0,
+            "title": "Age",
+            "description": "Age in years. Outside 21-79 the model has seen no examples, so the record is refused rather than extrapolated."
+          },
+          "PAY_1": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 1",
+            "description": "Repayment status last month: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "PAY_2": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 2",
+            "description": "Repayment status two months ago: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "PAY_3": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 3",
+            "description": "Repayment status three months ago: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "PAY_4": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 4",
+            "description": "Repayment status four months ago: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "PAY_5": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 5",
+            "description": "Repayment status five months ago: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "PAY_6": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": -2.0,
+            "title": "Pay 6",
+            "description": "Repayment status six months ago: -2 no consumption, -1 paid in full, 0 revolving credit, 1-8 months overdue."
+          },
+          "BILL_AMT1": {
+            "type": "number",
+            "title": "Bill Amt1",
+            "description": "Statement balance last month, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "BILL_AMT2": {
+            "type": "number",
+            "title": "Bill Amt2",
+            "description": "Statement balance two months ago, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "BILL_AMT3": {
+            "type": "number",
+            "title": "Bill Amt3",
+            "description": "Statement balance three months ago, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "BILL_AMT4": {
+            "type": "number",
+            "title": "Bill Amt4",
+            "description": "Statement balance four months ago, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "BILL_AMT5": {
+            "type": "number",
+            "title": "Bill Amt5",
+            "description": "Statement balance five months ago, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "BILL_AMT6": {
+            "type": "number",
+            "title": "Bill Amt6",
+            "description": "Statement balance six months ago, in NT$. Negative is legitimate -- it means the account was in credit after an overpayment."
+          },
+          "PAY_AMT1": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt1",
+            "description": "Amount actually repaid last month, in NT$."
+          },
+          "PAY_AMT2": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt2",
+            "description": "Amount actually repaid two months ago, in NT$."
+          },
+          "PAY_AMT3": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt3",
+            "description": "Amount actually repaid three months ago, in NT$."
+          },
+          "PAY_AMT4": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt4",
+            "description": "Amount actually repaid four months ago, in NT$."
+          },
+          "PAY_AMT5": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt5",
+            "description": "Amount actually repaid five months ago, in NT$."
+          },
+          "PAY_AMT6": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Pay Amt6",
+            "description": "Amount actually repaid six months ago, in NT$."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "LIMIT_BAL",
+          "SEX",
+          "EDUCATION",
+          "MARRIAGE",
+          "AGE",
+          "PAY_1",
+          "PAY_2",
+          "PAY_3",
+          "PAY_4",
+          "PAY_5",
+          "PAY_6",
+          "BILL_AMT1",
+          "BILL_AMT2",
+          "BILL_AMT3",
+          "BILL_AMT4",
+          "BILL_AMT5",
+          "BILL_AMT6",
+          "PAY_AMT1",
+          "PAY_AMT2",
+          "PAY_AMT3",
+          "PAY_AMT4",
+          "PAY_AMT5",
+          "PAY_AMT6"
+        ],
+        "title": "CreditApplication",
+        "description": "One cardholder-month, in the shape the core-banking extract emits.",
+        "examples": [
+          {
+            "AGE": 39,
+            "BILL_AMT1": 113500.0,
+            "BILL_AMT2": 110200.0,
+            "BILL_AMT3": 107800.0,
+            "BILL_AMT4": 104300.0,
+            "BILL_AMT5": 99900.0,
+            "BILL_AMT6": 95100.0,
+            "EDUCATION": 2,
+            "LIMIT_BAL": 120000.0,
+            "MARRIAGE": 1,
+            "PAY_1": 2,
+            "PAY_2": 2,
+            "PAY_3": 0,
+            "PAY_4": 0,
+            "PAY_5": 0,
+            "PAY_6": 0,
+            "PAY_AMT1": 0.0,
+            "PAY_AMT2": 4000.0,
+            "PAY_AMT3": 3800.0,
+            "PAY_AMT4": 5000.0,
+            "PAY_AMT5": 4500.0,
+            "PAY_AMT6": 4200.0,
+            "SEX": 2,
+            "account_id": "A-10023"
+          }
+        ]
+      },
+      "ErrorResponse": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Stable machine-readable reason, e.g. 'model_not_loaded'."
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "One sentence a human can act on."
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail",
+            "description": "Field names and rules that failed. Never the submitted values."
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "title": "ErrorResponse",
+        "description": "The single error shape every failing endpoint returns."
+      },
+      "ExplainResponse": {
+        "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Id"
+          },
+          "default_probability": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Default Probability"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "intervene",
+              "monitor"
+            ],
+            "title": "Decision"
+          },
+          "risk_band": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "title": "Risk Band"
+          },
+          "threshold_used": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Threshold Used"
+          },
+          "threshold_policy": {
+            "type": "string",
+            "title": "Threshold Policy"
+          },
+          "shap": {
+            "$ref": "#/components/schemas/ShapExplanation"
+          },
+          "lime": {
+            "$ref": "#/components/schemas/LimeExplanation"
+          },
+          "top_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Top Reasons",
+            "description": "Plain-English drivers of the score, largest first. This is a draft adverse-action notice and requires human review before it is sent."
+          },
+          "agreement": {
+            "$ref": "#/components/schemas/Agreement"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "served_at": {
+            "type": "string",
+            "title": "Served At"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "default_probability",
+          "decision",
+          "risk_band",
+          "threshold_used",
+          "threshold_policy",
+          "shap",
+          "lime",
+          "top_reasons",
+          "agreement",
+          "model_name",
+          "model_version",
+          "request_id"
+        ],
+        "title": "ExplainResponse",
+        "description": "SHAP, LIME, their overlap, and a draft adverse-action notice.",
+        "examples": [
+          {
+            "agreement": {
+              "note": "SHAP and LIME agree on 1 of the top 3 drivers.",
+              "top3_overlap": 1
+            },
+            "decision": "intervene",
+            "default_probability": 0.7369284676988783,
+            "lime": {
+              "contributions": [
+                {
+                  "feature": "months_since_last_delinquency <= 2.00",
+                  "weight": 0.11969707657229522
+                },
+                {
+                  "feature": "total_pay_amt <= 6234.50",
+                  "weight": 0.08349350240368114
+                },
+                {
+                  "feature": "utilization_m5 <= 0.01",
+                  "weight": 0.06519232350168992
+                }
+              ]
+            },
+            "model_name": "credit-risk",
+            "model_version": "2",
+            "request_id": "767f002a55a746e8bbb9a631d8ac27a5",
+            "risk_band": "high",
+            "served_at": "2026-10-03T04:18:42Z",
+            "shap": {
+              "base_value": -1.515763556521393,
+              "contributions": [
+                {
+                  "feature": "months_since_last_delinquency",
+                  "shap": 0.8741883328146505,
+                  "value": 1.0
+                },
+                {
+                  "feature": "PAY_1",
+                  "shap": 0.5591900821099798,
+                  "value": 2.0
+                },
+                {
+                  "feature": "total_bill_amt",
+                  "shap": 0.276083116432872,
+                  "value": 7704.0
+                }
+              ]
+            },
+            "threshold_policy": "base",
+            "threshold_used": 0.5,
+            "top_reasons": [
+              "The time since the last missed payment (1) increased the estimated risk of default.",
+              "The repayment status last month (2) increased the estimated risk of default.",
+              "The total billed over six months (7704) increased the estimated risk of default."
+            ]
+          }
+        ]
+      },
+      "FairnessReportResponse": {
+        "properties": {
+          "protected_attribute": {
+            "type": "string",
+            "title": "Protected Attribute"
+          },
+          "threshold_policy": {
+            "type": "string",
+            "title": "Threshold Policy"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/GroupFairness"
+            },
+            "type": "array",
+            "title": "Groups"
+          },
+          "demographic_parity_difference": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Demographic Parity Difference",
+            "description": "Widest observed gap in selection rate. Null if under two groups."
+          },
+          "max_demographic_parity_difference": {
+            "type": "number",
+            "title": "Max Demographic Parity Difference",
+            "description": "The registration gate the model passed offline."
+          },
+          "max_equalized_odds_difference": {
+            "type": "number",
+            "title": "Max Equalized Odds Difference",
+            "description": "The registration gate the model passed offline."
+          },
+          "within_gate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Within Gate",
+            "description": "Whether the live gap is still inside the demographic-parity gate."
+          },
+          "note": {
+            "type": "string",
+            "title": "Note"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "protected_attribute",
+          "threshold_policy",
+          "groups",
+          "max_demographic_parity_difference",
+          "max_equalized_odds_difference",
+          "note",
+          "model_name",
+          "model_version",
+          "request_id"
+        ],
+        "title": "FairnessReportResponse",
+        "description": "Fairness of the model that is serving right now, not of an offline run.",
+        "examples": [
+          {
+            "generated_at": "2026-10-03T04:18:41Z",
+            "groups": [
+              {
+                "group": "sex_male",
+                "threshold": 0.5
+              },
+              {
+                "group": "sex_female",
+                "threshold": 0.5
+              }
+            ],
+            "max_demographic_parity_difference": 0.05,
+            "max_equalized_odds_difference": 0.08,
+            "model_name": "credit-risk",
+            "model_version": "2",
+            "note": "Selection rates are measured over the service's recent request window, not over a labelled test set. Equalized odds cannot be computed online because outcomes are only known a month later; the registered model passed a 0.08 gate offline.",
+            "protected_attribute": "SEX",
+            "request_id": "abb82478fdce45ed98805075fe040e62",
+            "threshold_policy": "base"
+          }
+        ]
+      },
+      "GroupFairness": {
+        "properties": {
+          "group": {
+            "type": "string",
+            "title": "Group"
+          },
+          "threshold": {
+            "type": "number",
+            "title": "Threshold",
+            "description": "The cutoff currently applied to this group."
+          },
+          "selection_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Rate",
+            "description": "Share of recent requests from this group that were flagged."
+          }
+        },
+        "type": "object",
+        "required": [
+          "group",
+          "threshold"
+        ],
+        "title": "GroupFairness"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ],
+            "title": "Status"
+          },
+          "model_loaded": {
+            "type": "boolean",
+            "title": "Model Loaded"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id",
+            "description": "The MLflow run the serving version was trained in."
+          },
+          "model_ref": {
+            "type": "string",
+            "enum": [
+              "alias",
+              "stage",
+              "unknown"
+            ],
+            "title": "Model Ref",
+            "description": "How the serving version was found: 'alias' = models:/<name>@<MODEL_ALIAS> (the champion promotion sets); 'stage' = models:/<name>/<MODEL_STAGE>, the fallback when no version carries the alias; 'unknown' = no model is loaded."
+          },
+          "model_ref_uri": {
+            "type": "string",
+            "title": "Model Ref Uri",
+            "description": "The registry URI the version was resolved from, e.g. models:/x@champion."
+          },
+          "algo": {
+            "type": "string",
+            "title": "Algo"
+          },
+          "trained_at": {
+            "type": "string",
+            "title": "Trained At"
+          },
+          "api_version": {
+            "type": "string",
+            "title": "Api Version"
+          },
+          "threshold_policy": {
+            "type": "string",
+            "title": "Threshold Policy"
+          },
+          "threshold": {
+            "type": "number",
+            "title": "Threshold",
+            "description": "The base cutoff: a probability at or above it is 'intervene'."
+          },
+          "threshold_source": {
+            "type": "string",
+            "enum": [
+              "registry",
+              "env",
+              "fallback"
+            ],
+            "title": "Threshold Source",
+            "description": "'registry' = the threshold_at_k tag on the loaded version, the cutoff that admits the intervention capacity on its evaluation split; 'env' = DECISION_THRESHOLD, because THRESHOLD_SOURCE=env; 'fallback' = DECISION_THRESHOLD, because the loaded version carries no usable tag."
+          },
+          "uptime_seconds": {
+            "type": "number",
+            "title": "Uptime Seconds"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail",
+            "description": "Why the model is missing, if it is."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "model_loaded",
+          "model_name",
+          "model_version",
+          "run_id",
+          "model_ref",
+          "model_ref_uri",
+          "algo",
+          "trained_at",
+          "api_version",
+          "threshold_policy",
+          "threshold",
+          "threshold_source",
+          "uptime_seconds"
+        ],
+        "title": "HealthResponse",
+        "description": "Not 'the port answered' -- which model answered, and why it might not.",
+        "examples": [
+          {
+            "algo": "LGBMClassifier",
+            "api_version": "1.0.0",
+            "model_loaded": true,
+            "model_name": "credit-risk",
+            "model_ref": "stage",
+            "model_ref_uri": "models:/credit-risk/Production",
+            "model_version": "2",
+            "run_id": "3914189dcbc645808759fd94c2900e5f",
+            "status": "ok",
+            "threshold": 0.5,
+            "threshold_policy": "base",
+            "threshold_source": "fallback",
+            "trained_at": "unknown",
+            "uptime_seconds": 0.621
+          }
+        ]
+      },
+      "LimeContribution": {
+        "properties": {
+          "feature": {
+            "type": "string",
+            "title": "Feature",
+            "description": "A discretised condition, e.g. 'PAY_1 > 1.00'."
+          },
+          "weight": {
+            "type": "number",
+            "title": "Weight"
+          }
+        },
+        "type": "object",
+        "required": [
+          "feature",
+          "weight"
+        ],
+        "title": "LimeContribution"
+      },
+      "LimeExplanation": {
+        "properties": {
+          "contributions": {
+            "items": {
+              "$ref": "#/components/schemas/LimeContribution"
+            },
+            "type": "array",
+            "title": "Contributions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "contributions"
+        ],
+        "title": "LimeExplanation"
+      },
+      "PredictResponse": {
+        "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Id",
+            "description": "Echoed from the request."
+          },
+          "default_probability": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Default Probability",
+            "description": "Calibrated P(default next month)."
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "intervene",
+              "monitor"
+            ],
+            "title": "Decision",
+            "description": "'intervene' puts the account on the monthly outreach list."
+          },
+          "risk_band": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "title": "Risk Band",
+            "description": "Band relative to the portfolio base rate, for triage."
+          },
+          "threshold_used": {
+            "type": "number",
+            "title": "Threshold Used",
+            "description": "The cutoff this record was judged against."
+          },
+          "threshold_policy": {
+            "type": "string",
+            "title": "Threshold Policy",
+            "description": "'base' = one cutoff for everyone; 'group_aware_equalized_odds' = the per-group cutoffs fitted by the mitigation step."
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "served_at": {
+            "type": "string",
+            "title": "Served At"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id",
+            "description": "Correlates this response with the server logs."
+          }
+        },
+        "type": "object",
+        "required": [
+          "default_probability",
+          "decision",
+          "risk_band",
+          "threshold_used",
+          "threshold_policy",
+          "model_name",
+          "model_version",
+          "request_id"
+        ],
+        "title": "PredictResponse",
+        "description": "The scoring answer, including the policy that produced the decision.",
+        "examples": [
+          {
+            "decision": "intervene",
+            "default_probability": 0.7369284676988783,
+            "model_name": "credit-risk",
+            "model_version": "2",
+            "request_id": "b6efbb2d31d946269a3643ac296bf048",
+            "risk_band": "high",
+            "served_at": "2026-10-03T04:18:41Z",
+            "threshold_policy": "base",
+            "threshold_used": 0.5
+          }
+        ]
+      },
+      "ShapContribution": {
+        "properties": {
+          "feature": {
+            "type": "string",
+            "title": "Feature"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "The observed feature value."
+          },
+          "shap": {
+            "type": "number",
+            "title": "Shap",
+            "description": "Signed push on the log-odds. Positive = riskier."
+          }
+        },
+        "type": "object",
+        "required": [
+          "feature",
+          "shap"
+        ],
+        "title": "ShapContribution"
+      },
+      "ShapExplanation": {
+        "properties": {
+          "base_value": {
+            "type": "number",
+            "title": "Base Value",
+            "description": "The model's output for an average account."
+          },
+          "contributions": {
+            "items": {
+              "$ref": "#/components/schemas/ShapContribution"
+            },
+            "type": "array",
+            "title": "Contributions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base_value",
+          "contributions"
+        ],
+        "title": "ShapExplanation"
+      },
+      "VersionResponse": {
+        "properties": {
+          "api_title": {
+            "type": "string",
+            "title": "Api Title"
+          },
+          "api_version": {
+            "type": "string",
+            "title": "Api Version"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_version": {
+            "type": "string",
+            "title": "Model Version"
+          },
+          "algo": {
+            "type": "string",
+            "title": "Algo"
+          },
+          "trained_at": {
+            "type": "string",
+            "title": "Trained At"
+          },
+          "git_sha": {
+            "type": "string",
+            "title": "Git Sha"
+          },
+          "threshold_policy": {
+            "type": "string",
+            "title": "Threshold Policy"
+          }
+        },
+        "type": "object",
+        "required": [
+          "api_title",
+          "api_version",
+          "model_name",
+          "model_version",
+          "algo",
+          "trained_at",
+          "git_sha",
+          "threshold_policy"
+        ],
+        "title": "VersionResponse",
+        "description": "What is deployed, in the terms an incident review needs."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "inference",
+      "description": "Score accounts and explain the scores."
+    },
+    {
+      "name": "responsible-ai",
+      "description": "Fairness of the model that is actually serving traffic."
+    },
+    {
+      "name": "ops",
+      "description": "Health, version and Prometheus exposition."
+    }
+  ]
+}

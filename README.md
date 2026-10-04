@@ -432,16 +432,35 @@ make deploy-check                       # on the host: is the API serving the re
 The API serves `models:/credit-risk@champion`. When no version carries that
 alias — a registry promoted before aliases were used, like version 2 here — it
 falls back to the version in the Production stage, and `/health` says which one
-answered as `"model_ref": "alias"` or `"stage"`.
+answered as `"model_ref": "alias"` or `"stage"`. Once a version carries the
+alias, the alias alone decides: moving another version to Production in the
+MLflow UI no longer changes what serves. Use `set-champion` (below), which moves
+both.
 
 Registration decides whether a new model becomes the champion. A candidate that
 passed the performance and fairness gates is compared with the champion on the
-PR-AUC both runs logged on the same held-out split (the runs record its
-`data_test_sha256`). It is promoted when the registry has no champion, or when
-it is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005) below the champion.
-Otherwise it is registered as the challenger — alias `challenger`, stage
-Staging, and `promotion_decision`/`promotion_reason` tags saying why — and
-nothing changes for traffic until a person decides.
+PR-AUC both runs logged on the held-out split. It is promoted when the registry
+has no champion, or when it is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005)
+below the champion. Otherwise it is registered as the challenger — alias
+`challenger`, stage Staging, and `promotion_decision`/`promotion_reason` tags
+saying why — and nothing changes for traffic until a person decides.
+
+Two limits of that comparison, stated rather than hidden:
+
+- **The same held-out split is checked only when both runs recorded it.** Runs
+  log the split's content hash as `data_test_sha256`, and a candidate scored on
+  a different split is never promoted automatically. A run from before the hash
+  existed — version 2's — carries none, so the first comparison against it uses
+  the logged PR-AUCs unverified. The split is deterministic (batch 5 by ID), so
+  in practice it is the same rows, but nothing proves it; the version's
+  `promotion_reason` tag says "held-out split hash not recorded … compared as
+  logged".
+- **An unreadable registry is not an empty one.** If MLflow answers the
+  champion lookup with anything other than "not found" (a 5xx, a timeout), the
+  candidate is parked as the challenger rather than promoted. If the alias or
+  stage write itself fails, `register_model` exits 3 with `PROMOTION FAILED` and
+  the state it left the registry in, so the DAG task fails instead of going
+  green.
 
 The model is loaded once, at startup, so a promotion reaches traffic only when
 the API restarts. There is no reload endpoint on purpose: an unauthenticated

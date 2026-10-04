@@ -73,6 +73,9 @@ SUBPROCESS_TIMEOUT: Final = 3600
 # project (ADR 0006), and tests/data_quality/test_raw.py holds the two equal.
 TRANSIENT_EXIT_CODE: Final = 75
 
+# XCom key validate_raw pushes its report under, on success and on failure.
+VALIDATION_REPORT_XCOM_KEY: Final = "validation_report"
+
 DEFAULT_ARGS: Final[dict[str, Any]] = {
     "owner": "p1-data",
     "retries": 2,
@@ -223,17 +226,33 @@ def credit_risk_pipeline() -> None:
         return run_module(DOWNLOAD_MODULE).strip()
 
     @task(task_id="validate_raw")
-    def validate_raw_task(raw_path: str) -> dict[str, Any]:
+    def validate_raw_task(raw_path: str, ti: Any = None) -> dict[str, Any]:
         """Schema, ranges and null checks on the raw frame.
 
         The module exits 1 when more than schema.MAX_BAD_ROW_FRACTION of rows
         are broken, which fails this task and stops the DAG here. That is the
         intent: no downstream task should ever train on a frame that failed
         validation, and a red task is the cheapest possible way to say so.
-        The report lands in XCom either way, so a failed run still leaves the
-        evidence behind.
+
+        The report is pushed to XCom under VALIDATION_REPORT_XCOM_KEY *before*
+        the exit status is checked, so a failed run still leaves the evidence
+        behind. A passing run also returns it, as the task's return_value.
+        Fewer broken rows than the tolerance pass this task; clean_and_split
+        then quarantines them rather than training on them.
         """
-        return json.loads(run_module(VALIDATE_MODULE, "--raw", raw_path))
+        completed = _execute(VALIDATE_MODULE, "--raw", raw_path)
+        try:
+            report: dict[str, Any] | None = json.loads(completed.stdout)
+        except ValueError:
+            report = None
+        if report is not None and ti is not None:
+            ti.xcom_push(key=VALIDATION_REPORT_XCOM_KEY, value=report)
+        _raise_for_exit(VALIDATE_MODULE, completed)
+        if report is None:
+            raise AirflowFailException(
+                f"{VALIDATE_MODULE} exited 0 without a JSON report on stdout; nothing was checked"
+            )
+        return report
 
     @task(task_id="clean_and_split")
     def clean_and_split_task(raw_path: str) -> dict[str, Any]:

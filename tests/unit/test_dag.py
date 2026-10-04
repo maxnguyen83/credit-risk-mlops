@@ -21,6 +21,7 @@ way to run it against the built image, without touching the running stack:
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -145,3 +146,43 @@ def test_a_clean_exit_returns_what_the_module_printed(
 
 def test_the_download_task_has_retries_to_use(pipeline: DAG) -> None:
     assert pipeline.get_task("download_raw").retries >= 1
+
+
+# ------------------------------------------------------- validation evidence
+
+
+class _RecordingTaskInstance:
+    """Stands in for the TaskInstance Airflow injects as ``ti``."""
+
+    def __init__(self) -> None:
+        self.pushed: dict[str, Any] = {}
+
+    def xcom_push(self, key: str, value: Any, **kwargs: Any) -> None:
+        self.pushed[key] = value
+
+
+def test_a_failed_validation_still_leaves_its_report_in_xcom(
+    pipeline: DAG, dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The docstring promised this; a failing task used to push nothing."""
+    report = {"ok": False, "bad_row_fraction": 1.0, "checks": [{"name": "age_range"}]}
+    _exits(monkeypatch, dag_module, 1, stdout=json.dumps(report))
+    ti = _RecordingTaskInstance()
+
+    with pytest.raises(AirflowFailException):
+        pipeline.get_task("validate_raw").python_callable("/data/raw.parquet", ti=ti)
+
+    assert ti.pushed == {dag_module.VALIDATION_REPORT_XCOM_KEY: report}
+
+
+def test_a_passing_validation_returns_and_pushes_the_same_report(
+    pipeline: DAG, dag_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {"ok": True, "bad_row_fraction": 0.0, "checks": []}
+    _exits(monkeypatch, dag_module, 0, stdout=json.dumps(report))
+    ti = _RecordingTaskInstance()
+
+    returned = pipeline.get_task("validate_raw").python_callable("/data/raw.parquet", ti=ti)
+
+    assert returned == report
+    assert ti.pushed == {dag_module.VALIDATION_REPORT_XCOM_KEY: report}

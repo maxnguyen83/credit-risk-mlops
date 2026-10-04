@@ -70,6 +70,7 @@ from credit_risk.fairness.mitigation import (
 )
 from credit_risk.features.build import FEATURE_NAMES, build_features
 from credit_risk.models.evaluate import cost_matrix_report, evaluate, top_k_mask
+from credit_risk.models.registry import evaluate_gate, record_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -944,7 +945,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(result.tradeoff.to_string(index=False))
     # Non-zero exit when the winner cannot be registered, so the DAG task and a
     # human running this by hand learn the same thing at the same time.
-    return 0 if result.best.gate_passed else 2
+    if result.best.gate_passed:
+        return 0
+    # The DAG stops here, so evaluate_and_gate never tags this run. Tag it with
+    # the full gate's reasons, PR-AUC included; otherwise a combined refusal
+    # reads as fairness-only.
+    record_refusal(
+        result.run_id,
+        evaluate_gate(result.metrics, result.best.fairness),
+        tracking_uri=result.tracking_uri,
+    )
+    return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

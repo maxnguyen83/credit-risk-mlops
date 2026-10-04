@@ -15,11 +15,18 @@ into the model card.
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
+from typing import Any
 
 import mlflow
+import mlflow.pyfunc
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import pytest
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 
 from credit_risk import schema
 from credit_risk.data.split import BATCH_COL, write_splits
@@ -363,6 +370,105 @@ def test_load_production_model_returns_none_rather_than_raising(local_mlflow):
     assert load_production_model(model_uri="models:/does-not-exist/Production") is None
 
 
+VERSION_URI = "models:/credit-risk/3"
+LOCAL_COPY = "/downloaded/credit-risk/3/model"
+
+# What MLflow 2.19 raises for a version logged without the sklearn flavour. A
+# missing version raises the same type with the same code, so no except clause
+# can tell the two apart; only which step failed can.
+NO_SKLEARN_FLAVOUR = MlflowException(
+    'Model does not have the "sklearn" flavor', RESOURCE_DOES_NOT_EXIST
+)
+
+
+def raising(exc: BaseException) -> Callable[[str], Any]:
+    def fail(_uri: str) -> Any:
+        raise exc
+
+    return fail
+
+
+def stub_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    download: Callable[[str], Any],
+    sklearn: Callable[[str], Any],
+) -> list[tuple[str, str]]:
+    """Replace the MLflow calls behind load_production_model; record each call.
+
+    Nothing reaches a store, so each step does exactly what the test says.
+    pyfunc is stubbed to succeed and recorded, so a fallback to it shows up
+    both in the result and in the calls.
+    """
+    calls: list[tuple[str, str]] = []
+
+    def recorded(name: str, behaviour: Callable[[str], Any]) -> Callable[..., Any]:
+        def call(model_uri: str | None = None, **kwargs: Any) -> Any:
+            uri = str(model_uri if model_uri is not None else kwargs["artifact_uri"])
+            calls.append((name, uri))
+            return behaviour(uri)
+
+        return call
+
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", recorded("download", download))
+    monkeypatch.setattr(mlflow.sklearn, "load_model", recorded("sklearn", sklearn))
+    monkeypatch.setattr(mlflow.pyfunc, "load_model", recorded("pyfunc", lambda _uri: object()))
+    return calls
+
+
+def test_load_production_model_loads_the_sklearn_flavour_from_the_downloaded_copy(monkeypatch):
+    estimator = object()
+    calls = stub_loading(
+        monkeypatch, download=lambda _uri: LOCAL_COPY, sklearn=lambda _uri: estimator
+    )
+
+    assert load_production_model(model_uri=VERSION_URI) is estimator
+    # One trip to the store; the flavour is read from the copy it left on disk.
+    assert calls == [("download", VERSION_URI), ("sklearn", LOCAL_COPY)]
+
+
+def test_load_production_model_refuses_a_version_without_the_sklearn_flavour(monkeypatch, caplog):
+    # A PyFuncModel would load, but it has no predict_proba: /health would go
+    # green and every scoring request would fail, with ModelNotLoaded unable to
+    # fire. Starting degraded, and saying why, is the honest state.
+    calls = stub_loading(
+        monkeypatch, download=lambda _uri: LOCAL_COPY, sklearn=raising(NO_SKLEARN_FLAVOUR)
+    )
+
+    with caplog.at_level(logging.WARNING, logger=registry_module.__name__):
+        assert load_production_model(model_uri=VERSION_URI) is None
+
+    assert calls == [("download", VERSION_URI), ("sklearn", LOCAL_COPY)]
+    assert VERSION_URI in caplog.text
+    assert "scikit-learn flavour" in caplog.text and "predict_proba" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MlflowException(
+            "API request to http://mlflow:5000/api/2.0/mlflow/model-versions/get failed "
+            "with exception ConnectionError: Max retries exceeded"
+        ),
+        MlflowException(
+            "Model Version (name=credit-risk, version=3) not found", RESOURCE_DOES_NOT_EXIST
+        ),
+        OSError("artifact store refused s3://mlflow/1/run/artifacts/model: AccessDenied"),
+    ],
+    ids=["unreachable-server", "missing-version", "artifact-store"],
+)
+def test_load_production_model_returns_none_on_a_store_failure_without_loading_a_flavour(
+    monkeypatch, caplog, failure
+):
+    calls = stub_loading(monkeypatch, download=raising(failure), sklearn=raising(failure))
+
+    with caplog.at_level(logging.WARNING, logger=registry_module.__name__):
+        assert load_production_model(model_uri=VERSION_URI) is None
+
+    assert calls == [("download", VERSION_URI)]
+    assert str(failure) in caplog.text
+
+
 def test_promote_reports_failure_instead_of_raising(local_mlflow):
     decision = promote(1, "Production", model_name="does-not-exist")
 
@@ -554,7 +660,7 @@ def test_main_exits_non_zero_when_the_winner_fails_the_fairness_gate(monkeypatch
         return TrainingResult(
             best=stub_candidate(gate_passed=kwargs["folds"] > 2),
             candidates=[stub_candidate(gate_passed=True)],
-            tracking_uri="file:///tmp/mlruns",
+            tracking_uri=(tmp_path / "mlruns").as_uri(),
             used_fallback_store=True,
             tradeoff=pd.DataFrame([{"strategy": "baseline", "pr_auc": 0.6}]),
         )
@@ -723,7 +829,7 @@ def _handoff(tmp_path, *, gate_passed: bool, run_id: str | None = "run-1") -> ob
             {
                 "run_id": run_id,
                 "model": "lightgbm",
-                "tracking_uri": "file:///tmp/mlruns",
+                "tracking_uri": (tmp_path / "mlruns").as_uri(),
                 "used_fallback_store": False,
                 "metrics": {
                     "pr_auc": 0.61 if gate_passed else 0.10,

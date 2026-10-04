@@ -10,6 +10,7 @@ DAG shells out to, against the artefact the previous one writes.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -76,6 +77,31 @@ def artefact(tmp_path: Path) -> Path:
     path = tmp_path / "training_result.json"
     path.write_text(json.dumps(_result_payload()))
     return path
+
+
+class RecordingClient:
+    """Stands in for MlflowClient: keeps the run tags written, talks to no server."""
+
+    def __init__(self) -> None:
+        self.tracking_uris: list[str | None] = []
+        self.tags: dict[str, dict[str, str]] = {}
+
+    def __call__(self, tracking_uri: str | None = None, **_kwargs: object) -> RecordingClient:
+        # Called where the code builds MlflowClient(...), so a test can check
+        # the tag went to the store training logged the run to.
+        self.tracking_uris.append(tracking_uri)
+        return self
+
+    def set_tag(self, run_id: str, key: str, value: str) -> None:
+        self.tags.setdefault(run_id, {})[key] = value
+
+
+@pytest.fixture
+def mlflow_client(monkeypatch: pytest.MonkeyPatch) -> RecordingClient:
+    """Every test here that refuses a candidate takes this, so none writes to a store."""
+    client = RecordingClient()
+    monkeypatch.setattr(registry_module, "MlflowClient", client)
+    return client
 
 
 # ------------------------------------------------------- hand-off artefact
@@ -145,7 +171,9 @@ def test_evaluate_cli_passes_a_clean_candidate(
     assert "GATE PASSED" in capsys.readouterr().out
 
 
-def test_evaluate_cli_exits_non_zero_when_the_gate_refuses(tmp_path: Path) -> None:
+def test_evaluate_cli_exits_non_zero_when_the_gate_refuses(
+    tmp_path: Path, mlflow_client: RecordingClient
+) -> None:
     path = tmp_path / "training_result.json"
     path.write_text(json.dumps(_result_payload(gate_passed=False)))
     out = tmp_path / "gate.json"
@@ -160,7 +188,9 @@ def test_evaluate_cli_exits_non_zero_when_the_gate_refuses(tmp_path: Path) -> No
     assert decision["reasons"], "a refusal with no reason is not auditable"
 
 
-def test_evaluate_cli_recomputes_the_gate_rather_than_trusting_the_flag(tmp_path: Path) -> None:
+def test_evaluate_cli_recomputes_the_gate_rather_than_trusting_the_flag(
+    tmp_path: Path, mlflow_client: RecordingClient
+) -> None:
     """A payload that claims it passed but breaches the thresholds is refused."""
     payload = _result_payload(gate_passed=False)
     payload["gate_passed"] = True  # a lie the artefact could carry
@@ -170,6 +200,190 @@ def test_evaluate_cli_recomputes_the_gate_rather_than_trusting_the_flag(tmp_path
 
     code = evaluate_module.main(["--result", str(path), "--out", str(tmp_path / "gate.json")])
     assert code == 2
+
+
+def _artefact_with(
+    tmp_path: Path, *, pr_auc: float, dp: float, eo: float, run_id: str | None = "abc123"
+) -> Path:
+    payload = _result_payload()
+    payload["run_id"] = run_id
+    payload["metrics"]["pr_auc"] = pr_auc
+    payload["fairness"]["demographic_parity_difference"] = dp
+    payload["fairness"]["equalized_odds_difference"] = eo
+    path = tmp_path / "training_result.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("pr_auc", "dp", "eo", "named"),
+    [
+        (0.50, 0.0384, 0.0725, ["pr_auc"]),
+        (0.5668, 0.19, 0.0725, ["demographic_parity_difference"]),
+        (0.5668, 0.0384, 0.31, ["equalized_odds_difference"]),
+        (
+            0.50,
+            0.19,
+            0.31,
+            ["pr_auc", "demographic_parity_difference", "equalized_odds_difference"],
+        ),
+    ],
+    ids=["pr_auc-alone", "dp-alone", "eo-alone", "all-three"],
+)
+def test_evaluate_cli_tags_the_run_with_the_refusal_and_its_reasons(
+    tmp_path: Path,
+    mlflow_client: RecordingClient,
+    pr_auc: float,
+    dp: float,
+    eo: float,
+    named: list[str],
+) -> None:
+    """FR-6 on the path the DAG takes.
+
+    evaluate_and_gate fails the run, so register_model -- until now the only
+    step that wrote these tags -- never starts. A model refused on PR-AUC alone
+    passes training's fairness check too, so its run carried no refusal at all.
+    """
+    path = _artefact_with(tmp_path, pr_auc=pr_auc, dp=dp, eo=eo)
+    out = tmp_path / "gate.json"
+
+    assert evaluate_module.main(["--result", str(path), "--out", str(out)]) == 2
+
+    tags = mlflow_client.tags["abc123"]
+    assert tags["registration_refused"] == "true"
+    for name in named:
+        assert name in tags["registration_refusal_reasons"]
+    assert tags["registration_refusal_reasons"] == "; ".join(json.loads(out.read_text())["reasons"])
+    assert mlflow_client.tracking_uris == ["file:///tmp/mlruns"]
+
+
+def test_evaluate_cli_writes_no_refusal_onto_a_run_that_passed(
+    artefact: Path, mlflow_client: RecordingClient
+) -> None:
+    assert (
+        evaluate_module.main(["--result", str(artefact), "--out", str(artefact.parent / "g.json")])
+        == 0
+    )
+    assert mlflow_client.tags == {}
+
+
+def _tracking_server_gone(*_args: object, **_kwargs: object) -> None:
+    raise RuntimeError("tracking server gone")
+
+
+class RefusesTags:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    set_tag = staticmethod(_tracking_server_gone)
+
+
+@pytest.mark.parametrize(
+    "client", [_tracking_server_gone, RefusesTags], ids=["no-client", "tag-refused"]
+)
+def test_evaluate_cli_still_refuses_when_the_refusal_cannot_be_tagged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    client: object,
+) -> None:
+    # Losing the tag is survivable; a refusal that turns into a pass, or into a
+    # crash that hides why the task failed, is not.
+    monkeypatch.setattr(registry_module, "MlflowClient", client)
+    path = _artefact_with(tmp_path, pr_auc=0.50, dp=0.0384, eo=0.0725)
+    out = tmp_path / "gate.json"
+
+    with caplog.at_level(logging.WARNING, logger=registry_module.__name__):
+        assert evaluate_module.main(["--result", str(path), "--out", str(out)]) == 2
+
+    assert json.loads(out.read_text())["passed"] is False
+    assert "GATE REFUSED" in capsys.readouterr().err
+    assert "abc123" in caplog.text and "tracking server gone" in caplog.text
+
+
+def test_evaluate_cli_prints_the_verdict_before_it_reaches_for_the_tracking_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An unreachable server is retried for minutes; by then the task log must
+    # already say why the task failed.
+    printed_by_then: list[str] = []
+
+    def slow_store(*_args: object, **_kwargs: object) -> None:
+        printed_by_then.append(capsys.readouterr().err)
+
+    monkeypatch.setattr(registry_module, "record_refusal", slow_store)
+    path = _artefact_with(tmp_path, pr_auc=0.50, dp=0.0384, eo=0.0725)
+
+    assert evaluate_module.main(["--result", str(path), "--out", str(tmp_path / "gate.json")]) == 2
+    assert len(printed_by_then) == 1
+    assert "GATE REFUSED" in printed_by_then[0]
+
+
+def test_evaluate_cli_says_a_refusal_without_a_run_could_not_be_tagged(
+    tmp_path: Path, mlflow_client: RecordingClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _artefact_with(tmp_path, pr_auc=0.50, dp=0.0384, eo=0.0725, run_id=None)
+
+    with caplog.at_level(logging.WARNING, logger=registry_module.__name__):
+        code = evaluate_module.main(["--result", str(path), "--out", str(tmp_path / "gate.json")])
+
+    # --no-mlflow leaves no run, so there is nothing to tag and no store to ask.
+    assert code == 2
+    assert mlflow_client.tracking_uris == []
+    assert "no run" in caplog.text
+
+
+def _trained(payload: dict) -> train_module.TrainingResult:
+    """What train_all hands the CLI, for the candidate a hand-off payload describes."""
+    best = train_module.CandidateResult(
+        name=payload["model"],
+        run_id=payload["run_id"],
+        estimator=None,  # type: ignore[arg-type]
+        params={},
+        cv_pr_auc_mean=payload["metrics"]["pr_auc"],
+        cv_pr_auc_std=0.01,
+        metrics=payload["metrics"],
+        fairness=payload["fairness"],
+        gate_passed=payload["gate_passed"],
+        gate_reasons=payload["gate_reasons"],
+    )
+    return train_module.TrainingResult(
+        best=best,
+        candidates=[best],
+        tracking_uri=payload["tracking_uri"],
+        used_fallback_store=False,
+        tradeoff=pd.DataFrame(payload["tradeoff"]),
+    )
+
+
+def test_train_cli_tags_a_fairness_refusal_with_every_reason_the_gate_gives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mlflow_client: RecordingClient
+) -> None:
+    """A winner refused on fairness fails train_candidates, so evaluate_and_gate
+    never runs for it. Its run is tagged here, with the full gate's reasons --
+    PR-AUC included -- or a combined refusal reads as a fairness-only one."""
+    result = _trained(_result_payload(gate_passed=False))
+    monkeypatch.setattr(train_module, "train_all", lambda **_kwargs: result)
+
+    assert train_module.main(["--result", str(tmp_path / "training_result.json")]) == 2
+
+    tags = mlflow_client.tags["abc123"]
+    assert tags["registration_refused"] == "true"
+    for name in ("pr_auc", "demographic_parity_difference", "equalized_odds_difference"):
+        assert name in tags["registration_refusal_reasons"]
+    assert mlflow_client.tracking_uris == ["file:///tmp/mlruns"]
+
+
+def test_train_cli_leaves_no_refusal_on_a_run_that_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mlflow_client: RecordingClient
+) -> None:
+    result = _trained(_result_payload())
+    monkeypatch.setattr(train_module, "train_all", lambda **_kwargs: result)
+
+    assert train_module.main(["--result", str(tmp_path / "training_result.json")]) == 0
+    assert mlflow_client.tags == {}
+    assert mlflow_client.tracking_uris == []
 
 
 # ------------------------------------------------------------ registry cli

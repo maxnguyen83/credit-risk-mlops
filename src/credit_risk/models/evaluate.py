@@ -236,7 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Imported inside the function, unlike everything else in this module:
     # `models.train` imports this module at the top, so a module-level import
     # of it here is a cycle. Nothing above `main` needs either name.
-    from credit_risk.models.registry import evaluate_gate
+    from credit_risk.models.registry import evaluate_gate, record_refusal
     from credit_risk.models.train import load_training_result, training_result_path
 
     parser = argparse.ArgumentParser(description="Apply the performance and fairness gates")
@@ -269,7 +269,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(json.dumps(decision, indent=2))
 
     if reasons:
+        # The verdict first: an unreachable tracking server is retried for
+        # minutes, and the log must say why the task failed before that.
         print(f"\nGATE REFUSED: {'; '.join(reasons)}", file=sys.stderr)
+        # Then onto the run as well as in the file: this exit fails the DAG, so
+        # register_model, the other step that tags refusals, never runs.
+        record_refusal(result.get("run_id"), reasons, tracking_uri=result.get("tracking_uri"))
         return 2
     print("\nGATE PASSED")
     return 0

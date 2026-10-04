@@ -196,9 +196,30 @@ services:
     depends_on:
       mlflow:
         condition: service_healthy
-    command: standalone
+    # The console triggers DAGs and reads their state through Airflow's REST API
+    # with its own least-privileged user (role User), never the admin account
+    # standalone generates. Creating it is idempotent: a second start finds it.
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate > /dev/null
+        # The default roles only exist once permissions are synced; without
+        # this the create fails on a fresh database and the console gets 401.
+        airflow sync-perm > /dev/null
+        airflow users create --role User --username "$${CONSOLE_AIRFLOW_USER}" \
+          --password "$${CONSOLE_AIRFLOW_PASSWORD}" --firstname Console --lastname UI \
+          --email console@example.invalid > /dev/null 2>&1 || true
+        exec airflow standalone
     environment:
       <<: *s3-env
+      # Basic auth for the console's REST calls; session auth keeps the web UI working.
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      CONSOLE_AIRFLOW_USER: ${CONSOLE_AIRFLOW_USER:-console}
+      CONSOLE_AIRFLOW_PASSWORD: ${CONSOLE_AIRFLOW_PASSWORD:-change-me-console}
+      # credit_risk_scoring scores through the API, so a batch is decided by the
+      # same champion, threshold and validation as a single request.
+      CREDIT_API_URL: http://credit-api:8000
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
@@ -224,6 +245,40 @@ services:
       timeout: 10s
       retries: 20
       start_period: 60s
+    restart: unless-stopped
+
+  credit-console:
+    # The end-user page: pipeline diagrams with run buttons, batch upload, and
+    # the latest call list. Same image as the API (the package ships both apps),
+    # so the build section is repeated rather than a second Dockerfile.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: credit-risk-api:0.1.0
+    container_name: credit-console
+    depends_on:
+      credit-api:
+        condition: service_healthy
+      airflow:
+        condition: service_healthy
+    command: ["uvicorn", "credit_risk.console.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      AIRFLOW_URL: http://airflow:8080
+      AIRFLOW_USERNAME: ${CONSOLE_AIRFLOW_USER:-console}
+      AIRFLOW_PASSWORD: ${CONSOLE_AIRFLOW_PASSWORD:-change-me-console}
+      CONSOLE_DATA_DIR: /app/data
+      CONSOLE_LINK_HOST: ${CONSOLE_LINK_HOST:-localhost}
+    volumes:
+      # Read-write: uploads land in data/incoming, results are read from data/scored.
+      - ./data:/app/data
+    ports:
+      - "18090:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     restart: unless-stopped
 
   prometheus:

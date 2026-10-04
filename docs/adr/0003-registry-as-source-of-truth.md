@@ -8,7 +8,7 @@ The API must serve a specific, identifiable model version, and promoting a new o
 
 ## Decision
 
-The API resolves `models:/credit-risk@champion` at startup and pulls the artifact from MinIO via boto3. When no version carries the alias it falls back to `models:/credit-risk/Production`, and `/health` reports which of the two answered (`model_ref`).
+The API resolves `models:/credit-risk@champion` at startup and pulls the artifact from the SeaweedFS object store over the S3 API via boto3. When no version carries the alias it falls back to `models:/credit-risk/Production`, and `/health` reports which of the two answered (`model_ref`).
 
 Promotion moves the `champion` alias and also sets the Production stage, for anything that still reads stages. Registration promotes a gated candidate only when the registry has no champion or the candidate's held-out PR-AUC is no more than `PROMOTION_PR_AUC_TOLERANCE` below the champion's; otherwise it becomes the `challenger` (Staging) and a person promotes it with `python -m credit_risk.models.registry set-champion --version N`. A champion lookup that fails for any reason other than "not found" parks the candidate as the challenger, and a promotion that cannot be written fails the register step (exit 3).
 

@@ -239,13 +239,16 @@ services:
   alertmanager:
     image: prom/alertmanager:v0.27.0
     container_name: credit-alertmanager
+    # Starts on the no-op config unless a Telegram bot token and chat id are in
+    # the secrets mount below; anything incomplete falls back to it, logged.
+    # No secret is needed to start. Turning delivery on: docs/ALERTING.md.
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
     volumes:
       - ./monitoring/alertmanager:/etc/alertmanager:ro
-    environment:
-      # Empty is fine: the default route is a null receiver, so an
-      # unconfigured Telegram cannot take the demo down.
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Files, not environment variables: Alertmanager reads the token itself
+      # and nothing secret shows up in `docker inspect`. Gitignored by default;
+      # set an absolute path in .env to keep the files outside the checkout.
+      - ${ALERTMANAGER_SECRETS_DIR:-./monitoring/alertmanager/secrets}:/run/secrets/alertmanager:ro
     ports:
       - "19093:9093"
     restart: unless-stopped

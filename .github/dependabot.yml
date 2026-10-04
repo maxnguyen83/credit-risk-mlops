@@ -18,6 +18,10 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # MLflow 2.19 imports FallbackAsyncAdaptedQueuePool, which SQLAlchemy 2.1
+      # removed (see the pin in pyproject.toml). Lift this with the MLflow upgrade.
+      - dependency-name: "sqlalchemy"
+        versions: [">=2.1"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

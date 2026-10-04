@@ -193,7 +193,7 @@ selection-rate gap is 0.046 under the normal arrival mix (male 0.128, female
 thresholds enabled — all inside the 0.05 limit.
 
 We are reporting the silence rather than lowering the threshold until we got a
-screenshot. Three consequences we think are worth stating:
+screenshot. Four consequences we think are worth stating:
 
 - **The alert is armed and honest.** Its expression evaluates against live data;
   it is quiet because the system is within the policy somebody wrote down. An
@@ -204,6 +204,23 @@ screenshot. Three consequences we think are worth stating:
   not from normal traffic. A slightly different population would make it flap.
   We kept the limit equal to the registration gate so the monitor and the gate
   enforce one policy, and we accept that this costs headroom.
+- **When it flaps, the threshold is not the thing to change.** Firing, resolving
+  and firing again is what a 0.004 margin predicts, so expect it. The response,
+  which the alert's own description repeats:
+  1. read the per-group rates (`credit_selection_rate`) and compare the traffic
+     mix, the serving model version and `THRESHOLD_POLICY` with the last quiet
+     period;
+  2. hand what you found to compliance, who own the policy — not to the on-call
+     engineer, there is nothing to restart;
+  3. if only the mix moved, a time-boxed Alertmanager silence that names the
+     reason stops the noise, leaves the alert visible, and expires on its own;
+  4. if the model or the policy changed, or the gap keeps widening, treat it as a
+     regression.
+
+  Raising the alert's limit on its own would leave the monitor and the gate
+  enforcing two different policies, the second one decided by whoever was tired
+  of the notifications. Moving the limit is a compliance decision, and it moves
+  the registration gate (`evaluate_and_gate`, ADR 0009) and the alert together.
 - **Mitigation moves this metric the wrong way, on purpose.** Group-aware
   thresholds cut equalized-odds difference from 0.0725 to 0.0202 and widen the
   selection-rate gap from 0.025 to 0.040. Demographic parity and equalized odds
@@ -231,11 +248,14 @@ cannot report that it is fair.
 
 ### Alerts are addressed to humans, on purpose
 
-`FairnessGapExceeded` is meant for a person. Today it reaches nobody: every
-Alertmanager route ends at the `null` receiver. The Telegram receiver that would
-carry it to a human is defined, but no route points at it until a bot token and
-chat id are configured (`monitoring/alertmanager/alertmanager.yml`). Either way
-it does not trigger an automatic retrain, a threshold adjustment, or a rollback.
+`FairnessGapExceeded` is meant for a person. Whether it reaches one depends on
+configuration, and the default is no. With a Telegram bot token and chat id
+mounted as files (`docs/ALERTING.md`), it is delivered to that chat with the other
+warnings — silently, in a group of its own, with a description that says what to
+check and that it goes to compliance. Without them, which is how a fresh clone
+starts, it is recorded and shown in the Alertmanager UI and in Grafana and
+reaches someone only if they look. Either way it does not trigger an automatic
+retrain, a threshold adjustment, or a rollback.
 That is a design decision, not a missing feature: a system that automatically
 adjusts its own fairness behaviour in response to its own metrics is one where
 nobody can say afterwards who decided what. Keeping a human in the loop keeps

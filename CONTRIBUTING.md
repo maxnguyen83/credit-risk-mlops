@@ -19,10 +19,10 @@ fair, which is the same as not knowing whether it works.
 
 | | Member | Branch | Primary ownership | Responsible-AI ownership |
 |---|---|---|---|---|
-| **P1** | `maxnguyen83` | `p1/data-pipeline` | Data and pipeline — download, validation, cleaning, splits, feature engineering, the Airflow DAG | **Bias in the data**: base rates by group, representation, `DATASHEET.md` |
-| **P2** | `Ducmanh2212` | `p2/model-fairness` | Model and tracking — training, hyperparameter search, cross-validation, evaluation, MLflow, the registry gate | **Fairness measurement and mitigation**: fairlearn metrics, three mitigation strategies, the trade-off curve, `MODEL_CARD.md` |
-| **P3** | `hieunt-fsb-ai` | `p3/serving-explain` | Serving and deployment — FastAPI, OpenAPI, Dockerfiles, docker-compose | **Explainability**: SHAP, LIME, the `/explain` endpoint, the adverse-action notice draft |
-| **P4** | `thientd2609` | `p4/monitoring-cicd` | Monitoring and CI/CD — Prometheus, Grafana, Alertmanager, GitHub Actions, the traffic generator | **Fairness in production**: `credit_selection_rate`, the `FairnessGapExceeded` alert, the fairness dashboard |
+| **P1** | `maxnguyen83` | `p1/core`, `p1/docs` | Data and pipeline — download, validation, cleaning, splits, feature engineering, the Airflow DAG | **Bias in the data**: base rates by group, representation, `DATASHEET.md` |
+| **P2** | `Ducmanh2212` | `p2/core`, `p2/docs` | Model and tracking — training, hyperparameter search, cross-validation, evaluation, MLflow, the registry gate | **Fairness measurement and mitigation**: fairlearn metrics, three mitigation strategies, the trade-off curve, `MODEL_CARD.md` |
+| **P3** | `hieunt-fsb-ai` | `p3/core`, `p3/docs` | Serving and deployment — FastAPI, OpenAPI, Dockerfiles, docker-compose | **Explainability**: SHAP, LIME, the `/explain` endpoint, the adverse-action notice draft |
+| **P4** | `thientd2609` | `p4/core`, `p4/docs` | Monitoring and CI/CD — Prometheus, Grafana, Alertmanager, GitHub Actions, the traffic generator | **Fairness in production**: `credit_selection_rate`, the `FairnessGapExceeded` alert, the fairness dashboard |
 
 ### Files each member owns
 
@@ -75,14 +75,20 @@ that query it, so the metric names are also asserted in
 ## 3. Git workflow
 
 ```
-main                     protected; always green; never pushed to directly
-  └── p1/data-pipeline       ingestion, validation, splits, features, the DAG
-  └── p2/model-fairness      training, evaluation, registry gate, fairness
-  └── p3/serving-explain     API, SHAP/LIME, Dockerfiles, compose
-  └── p4/monitoring-cicd     metrics, alerts, dashboards, CI
+main             protected; always green; never pushed to directly
+  └── p1/core        ingestion, validation, splits, features, the DAG
+  └── p1/docs        P1's documentation
+  └── p2/core        training, evaluation, registry gate, fairness
+  └── p2/docs        P2's documentation
+  └── p3/core        API, SHAP/LIME, Dockerfiles, compose
+  └── p3/docs        P3's documentation
+  └── p4/core        metrics, alerts, dashboards, CI
+  └── p4/docs        P4's documentation
 ```
 
-**Branches.** `p{1..4}/<short-description>`, kebab-case.
+**Branches.** Two per member: `p{1..4}/core` for code and tests,
+`p{1..4}/docs` for documentation. They merge into `main` in member order:
+p1, then p2, p3 and p4.
 
 **Commits.** Conventional Commits, scoped to the area:
 

@@ -415,7 +415,8 @@ When CI passes on a push to `main` it:
 4. runs `scripts/verify_deploy.py`, which fails the deploy unless the version
    the `champion` alias names (the Production stage when no version carries
    it), the version `/health` reports and the version that scores
-   `docs/examples/high_risk.json` are the same.
+   `docs/examples/high_risk.json` are the same, and `/version` reports the
+   deployed commit.
 
 The run summary records the commit, the model version served and whether the
 alias or the stage named it, and the health of every container. Registering the

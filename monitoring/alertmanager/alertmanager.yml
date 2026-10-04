@@ -1,0 +1,137 @@
+# Alertmanager routing.
+#
+# Design constraint that shaped this whole file: Alertmanager validates every
+# receiver at startup and exits non-zero if one is malformed. A `telegram_config`
+# with an empty chat_id is malformed. So "leave the Telegram credentials blank
+# and it just won't notify" is not available -- blank credentials stop the stack
+# from coming up at all, which during a live demo means nine services down
+# because of a notifier nobody was going to look at.
+#
+# Hence the shape below: EVERY route lands on the `null` receiver, and Telegram
+# is opt-in. With no bot configured the stack starts, every alert is still
+# visible in the Alertmanager UI and in Grafana, and nothing is sent anywhere.
+# Enabling it is a short checklist, documented on the receiver.
+#
+# Note what "default route is null" does NOT buy on its own: the top-level
+# receiver is only the fallback for alerts that match no child route. An earlier
+# version of this file pointed the severity child-routes at telegram, which is
+# seven of the eight rules, and those seven attempted a send against a bot that
+# did not exist on every single notification -- while the header of the file
+# claimed nothing was sent anywhere. The child routes carry the severity-
+# specific timing; the receiver they name is the one line to change.
+
+global:
+  resolve_timeout: 5m
+
+templates: []
+
+route:
+  # Swallow by default. See the note above: an unconfigured notifier must never
+  # be able to take the stack down.
+  receiver: "null"
+
+  # Group by the alert and its severity, not by instance. One API container
+  # means grouping by instance would produce one notification per alert anyway;
+  # grouping by severity is what makes "3 critical, 2 warning" readable in a
+  # single message.
+  group_by: ["alertname", "severity"]
+
+  # 30s to let a burst of related alerts arrive before the first message, 5m
+  # before appending newly-firing members to a group that already notified.
+  group_wait: 30s
+  group_interval: 5m
+
+  # Re-notify about a still-firing alert every 4 hours. Shorter and a Saturday
+  # incident trains everyone to mute the channel; longer and a genuine ongoing
+  # problem falls off the bottom of the chat.
+  repeat_interval: 4h
+
+  routes:
+    # --- severity routing -------------------------------------------------
+    # The timing below is the real policy; `receiver` is the switch. Change
+    # these two lines to `telegram` once the token file exists (see the receiver
+    # at the bottom) and nothing else about this file needs to move.
+    #
+    # Critical: something is not serving. Notify fast, repeat often.
+    - receiver: "null"
+      matchers:
+        - severity = "critical"
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+      continue: false
+
+    # Warning: the service works but an SLO or a fairness gate is breached.
+    # This is where FairnessGapExceeded lands -- it is not a page, it is a
+    # message someone reads during working hours and acts on deliberately.
+    - receiver: "null"
+      matchers:
+        - severity = "warning"
+      group_wait: 1m
+      repeat_interval: 4h
+      continue: false
+
+    # Info: dashboard material. Routed explicitly to `null` rather than left to
+    # fall through, so that the intent is written down instead of inferred.
+    - receiver: "null"
+      matchers:
+        - severity = "info"
+
+inhibit_rules:
+  # If the API is down, every model and fairness rule reading its metrics goes
+  # stale or fires on last-known values. Suppressing them keeps the notification
+  # to the one fact that matters: the service is gone.
+  - source_matchers:
+      - alertname = "ApiDown"
+    target_matchers:
+      - severity =~ "warning|info"
+    equal: ["stack"]
+
+  # ModelNotLoaded makes every prediction a 503, which will also trip
+  # HighErrorRate. The cause is more useful than the symptom.
+  - source_matchers:
+      - alertname = "ModelNotLoaded"
+    target_matchers:
+      - alertname = "HighErrorRate"
+    equal: ["stack"]
+
+receivers:
+  # Alerts routed here are recorded and displayed, and go no further. This is
+  # the default, on purpose.
+  - name: "null"
+
+  # --- Telegram -----------------------------------------------------------
+  # Defined but unreferenced: no route points here. That is valid config, and it
+  # is what makes "an unconfigured notifier cannot affect the demo" true rather
+  # than aspirational.
+  #
+  # To turn this on, from the repository root:
+  #   1. mkdir -p monitoring/alertmanager/secrets
+  #   2. printf '%s' "$TELEGRAM_BOT_TOKEN" > monitoring/alertmanager/secrets/telegram_bot_token
+  #      (a file, not an environment variable: Alertmanager has no env expansion
+  #      of its own. The compose service mounts ./monitoring/alertmanager at
+  #      /etc/alertmanager read-only, which is enough -- the operator writes the
+  #      file on the host, Alertmanager only ever reads it.)
+  #   3. replace the placeholder chat_id below with TELEGRAM_CHAT_ID;
+  #   4. point the two severity child-routes above at `telegram`;
+  #   5. docker compose restart alertmanager.
+  #
+  # Until then, chat_id stays at the placeholder below. It is deliberately a
+  # valid-but-meaningless integer rather than 0 or empty, because both of those
+  # fail config validation and stop Alertmanager from starting.
+  #
+  # `secrets/` MUST be gitignored before step 2 is run. NEVER commit a real
+  # token or chat id to this file.
+  - name: telegram
+    telegram_configs:
+      - send_resolved: true
+        bot_token_file: /etc/alertmanager/secrets/telegram_bot_token
+        chat_id: 1
+        parse_mode: HTML
+        message: |-
+          <b>[{{ .Status | toUpper }}{{ if eq .Status "firing" }} x{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}</b>
+          severity: {{ .CommonLabels.severity }}
+          {{ range .Alerts -}}
+          • {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end -}}

@@ -19,8 +19,8 @@
 
 name: ddm501-credit-risk
 
-# MLflow and the API both reach MinIO through boto3, so they need the same
-# four variables. Defined once, anchored, reused.
+# MLflow and the API both reach the object store (SeaweedFS) through boto3, so
+# they need the same four variables. Defined once, anchored, reused.
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
   AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}

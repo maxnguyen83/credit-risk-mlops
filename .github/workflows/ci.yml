@@ -247,6 +247,20 @@ jobs:
             prom/prometheus:v2.55.1 \
             test rules /p/tests/rules_test.yml
 
+      - name: alertmanager configs and routes (amtool)
+        # Both Alertmanager configs load, share one routing tree, and send a
+        # pipeline failure, a critical and a warning alert to the receivers
+        # meant for them; the start-up switch falls back to the no-op config on
+        # anything short of a complete pair of Telegram secrets. Same image and
+        # tag as docker-compose.yml, so amtool parses YAML as the deployed
+        # Alertmanager does.
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/monitoring/alertmanager:/etc/alertmanager:ro" \
+            --entrypoint /bin/sh \
+            prom/alertmanager:v0.27.0 \
+            /etc/alertmanager/tests/test_config.sh
+
   # ---------------------------------------------------- dependency audit
   audit:
     name: dependency audit (report-only)

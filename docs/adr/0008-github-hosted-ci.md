@@ -8,7 +8,7 @@ A reviewer must be able to see a current, trustworthy build status at any time. 
 
 ## Decision
 
-`ci.yml` runs on `ubuntu-latest`, with a matrix over Python 3.11 and 3.12. `deploy.yml` runs on a self-hosted runner labelled `credit-risk` on the stack host, after CI succeeds on a push to `main`, and fails unless the API serves the registry's Production version.
+`ci.yml` runs on `ubuntu-latest`, with a matrix over Python 3.11 and 3.12. `deploy.yml` runs on a self-hosted runner labelled `credit-risk` on the stack host, after CI succeeds on a push to `main`, and fails unless the version the `champion` alias names (the Production stage's when no version carries it), the version `/health` reports and the version that scored `docs/examples/high_risk.json` are the same, and `/version` reports the deployed commit.
 
 ## Alternatives rejected
 

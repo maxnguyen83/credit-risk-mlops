@@ -18,7 +18,9 @@ received is not the file the pipeline was written against.
 gate does not make the bad rows good: it means there are few enough of them to
 set aside. :meth:`ValidationReport.row_failures` names the checks each row
 failed, and ``split.build_splits`` quarantines every row it names instead of
-training on it.
+training on it -- from the raw report and from the cleaned one, because a code
+outside both the dictionary and the folds (EDUCATION=7) is a raw warning that
+only becomes an error once cleaning has left it in place.
 
 Run it directly:
 

@@ -262,8 +262,10 @@ this use case that is correct behaviour, not a limitation.
 
 ### D3 — MLflow Registry is the source of truth for the model
 
-**Chosen.** The API resolves `models:/credit-risk/Production` at startup and
-downloads the artifact from the object store.
+**Chosen.** The API resolves `models:/credit-risk@champion` at startup and
+downloads the artifact from the object store. When no version carries the
+alias it falls back to `models:/credit-risk/Production`, and `/health` reports
+which one answered as `model_ref: "alias" | "stage"`.
 
 **Rejected.** Baking a `model.pkl` into the serving image.
 
@@ -272,16 +274,36 @@ Promoting a new model version becomes a registry operation — no rebuild, no
 redeploy of application code. It also lets `/health` report **which** model is
 serving, which is the first question anyone asks during an incident.
 
+An alias rather than a stage because stages are deprecated in MLflow and an
+alias names a role (`champion`, `challenger`) instead of a fixed lifecycle
+slot. Promotion still sets the Production stage, so the MLflow UI and anything
+else reading stages agree; the stage fallback exists for this project's own
+registry, whose version 2 was promoted before the alias was used
+(`python -m credit_risk.models.registry set-champion --version 2` ends it).
+
+Promotion is a decision, not a side effect of training. `register_model`
+promotes a candidate that passed the gates only when there is no champion, or
+when its held-out PR-AUC — logged on the same split, which each run records by
+hash — is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005, about half the
+cross-validation spread) below the champion's. Any other candidate is
+registered as the `challenger` (stage Staging) with a tag saying why, and a
+person promotes it with `set-champion` or leaves it.
+
 The decision threshold travels the same way. `register_model` tags each version
 with `threshold_at_k` (the capacity cut-off its evaluation computed),
 `capacity_fraction`, `trained_at`, `git_sha` and `run_id`. The API resolves the
-Production version first, loads the model by that version's own URI, and reads
-the cut-off from that version's tags, so the tags always describe the estimator
-that was loaded even if another version is promoted in between. Promoting a
+champion's version number first, loads the model by that version's own URI,
+and reads the cut-off from that version's tags, so the tags always describe the
+estimator that was loaded even if another version is promoted in between. Promoting a
 version moves its cut-off with it; nothing in configuration changes.
 `THRESHOLD_SOURCE=env` opts out and decides at `DECISION_THRESHOLD`.
 
-**Price.** The API depends on MLflow at startup. Mitigated by
+**Price.** The model is resolved once, at startup, so a promotion reaches
+traffic only after `docker compose restart credit-api` or a deploy, which
+restarts and then runs `scripts/verify_deploy.py`. There is no reload endpoint:
+an unauthenticated call that swaps the model is a worse risk than a restart.
+
+The API also depends on MLflow at startup. Mitigated by
 `depends_on: service_healthy` and by starting in an explicit **degraded** state
 (`/health` reports `model_loaded: false`, `/predict` returns 503) instead of
 crash-looping. A service that refuses to boot cannot tell you why it is unhappy.

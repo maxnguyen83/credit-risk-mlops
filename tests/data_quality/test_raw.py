@@ -452,6 +452,24 @@ class TestProvenance:
         assert len(metadata["sha256"]) == 64
         assert metadata["n_rows"] == len(synthetic_raw_df)
 
+    def test_a_sidecar_that_does_not_describe_its_parquet_is_not_believed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        """split.py reads the sidecar without going through download_raw, so a
+        split run after a crash would otherwise copy another file's digest
+        into the manifest."""
+        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
+        dest = tmp_path / "raw.parquet"
+        download_raw(dest=dest)
+        assert load_raw_metadata(dest)["sha256"]
+
+        synthetic_raw_df.head(10).to_parquet(dest, index=False)
+
+        assert load_raw_metadata(dest) == {}
+        dest.unlink()
+        assert load_raw_metadata(dest) == {}, "a digest cannot vouch for a missing file"
+
     def test_a_parquet_placed_by_hand_has_no_provenance_and_that_is_not_fatal(
         self, tmp_path: Path
     ) -> None:

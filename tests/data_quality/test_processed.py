@@ -286,6 +286,22 @@ def test_the_manifest_records_which_file_the_splits_came_from(
     assert manifest["source_n_rows"] == len(synthetic_raw_df)
 
 
+def test_a_sidecar_for_a_different_parquet_is_recorded_as_unknown_origin(
+    synthetic_raw_df: pd.DataFrame, tmp_path: Path
+) -> None:
+    raw_path = tmp_path / "raw.parquet"
+    synthetic_raw_df.to_parquet(raw_path, index=False)
+    raw_meta_path(raw_path).write_text(
+        json.dumps({"sha256": "a" * 64, "n_rows": 1, "parquet_sha256": "b" * 64}) + "\n"
+    )
+
+    manifest = build_splits(
+        synthetic_raw_df, tmp_path / "out", expect_full_dataset=False, raw_path=raw_path
+    )
+
+    assert manifest["source_sha256"] is None
+
+
 def test_an_unknown_origin_is_recorded_as_unknown(
     synthetic_raw_df: pd.DataFrame, tmp_path: Path
 ) -> None:

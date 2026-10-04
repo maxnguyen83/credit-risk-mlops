@@ -102,8 +102,15 @@ def load_raw_metadata(parquet_path: Path | None = None) -> dict[str, Any]:
     provenance record, not a reason to stop the pipeline. Callers record what
     they got; a manifest with ``source_sha256: null`` says "unknown origin"
     out loud, which is the honest answer.
+
+    A sidecar that records ``parquet_sha256`` is believed only when the parquet
+    beside it has that digest: after a crash mid-download, or a file swapped by
+    hand, it describes some other file, and copying its archive hash into a
+    manifest would be a false provenance claim. Older sidecars without the
+    digest are taken at their word.
     """
-    path = raw_meta_path(parquet_path)
+    target = raw_parquet_path() if parquet_path is None else Path(parquet_path)
+    path = raw_meta_path(target)
     if not path.exists():
         log.info("no provenance sidecar at %s; source digest will be unknown", path)
         return {}
@@ -114,6 +121,12 @@ def load_raw_metadata(parquet_path: Path | None = None) -> dict[str, Any]:
         return {}
     if not isinstance(loaded, dict):
         log.warning("%s does not hold a JSON object; ignoring it", path)
+        return {}
+    recorded = loaded.get("parquet_sha256")
+    if recorded is not None and (not target.exists() or recorded != _file_sha256(target)):
+        log.warning(
+            "%s describes a parquet that is not the one at %s; ignoring it", path.name, target
+        )
         return {}
     return loaded
 
@@ -201,16 +214,15 @@ def _completed_download(target: Path) -> tuple[bool, str]:
     """
     if not target.exists():
         return False, "no parquet"
+    # load_raw_metadata already refuses a sidecar whose parquet digest does
+    # not match the file, so an empty answer covers both "none" and "wrong".
     metadata = load_raw_metadata(target)
     if not metadata.get("sha256"):
         return False, "no provenance sidecar describes it"
-    recorded = metadata.get("parquet_sha256")
-    if recorded is None:
+    if metadata.get("parquet_sha256") is None:
         # A sidecar written before the parquet digest was recorded. It still
         # names the archive, which is all the manifest needs from it.
         return True, "sidecar predates the parquet digest"
-    if recorded != _file_sha256(target):
-        return False, "it is not the parquet its sidecar describes"
     return True, "parquet matches its sidecar"
 
 

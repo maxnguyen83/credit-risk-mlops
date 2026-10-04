@@ -1,27 +1,42 @@
 {{/*
   The one Telegram message every receiver in alertmanager.telegram.yml sends.
 
-  parse_mode is HTML, so every value that comes from a label or an annotation
-  goes through `html`. Without it a single "<" -- an Airflow exception such as
-  "<class 'KeyError'>" in a PipelineTaskFailed description is enough -- makes
-  Telegram reject the whole message, and the alert is lost with nothing but a
-  line in the Alertmanager log to show for it.
+  Escaping. With parse_mode HTML, Alertmanager v0.27 renders this through
+  html/template, which escapes every label and annotation value on its own: an
+  Airflow exception such as "<class 'KeyError'>" arrives as text, not as a tag
+  Telegram cannot parse. The <b> and <code> below are template text and stay
+  markup. Nothing here needs, or uses, an explicit escaping function.
 
-  Header: status, how many, severity, and the alert name when the group has
-  only one. Then one block per alert: name and summary, the DAG and task for a
-  pipeline failure, the description. Alertmanager cuts the result at Telegram's
-  4096-character limit.
+  Length. Telegram refuses a message over 4096 characters, and Alertmanager
+  cuts at that limit without regard for markup, so its cut can land inside a
+  tag and Telegram then rejects the whole message. This template stays well
+  under the limit instead:
+    1 alert          name, summary, description up to 1000 characters
+    2 or 3 alerts    the same, description up to 600 characters each
+    4 or more        name and summary of the first 10, then the total
+  Summaries are cut at 120 characters. Every cut is made on the plain value,
+  before escaping, so it can never split a tag or an entity. The full text is
+  always in the Alertmanager UI.
 */}}
 {{ define "credit.telegram.message" -}}
+{{ $n := len .Alerts -}}
 <b>[{{ .Status | toUpper }}{{ if eq .Status "firing" }} x{{ .Alerts.Firing | len }}{{ end }}]</b>
-{{- with .CommonLabels.severity }} {{ . | html }}{{ end }}
-{{- with .CommonLabels.alertname }} <b>{{ . | html }}</b>{{ end }}
-{{ range .Alerts }}
-• {{ if ne .Status $.Status }}[{{ .Status }}] {{ end }}<b>{{ .Labels.alertname | html }}</b>: {{ or .Annotations.summary "no summary" | html }}
+{{- with .CommonLabels.severity }} {{ . }}{{ end }}
+{{- with .CommonLabels.alertname }} <b>{{ . }}</b>{{ end }}
+{{ range $i, $alert := .Alerts }}{{ if lt $i 10 }}
+• {{ if ne .Status $.Status }}[{{ .Status }}] {{ end }}<b>{{ .Labels.alertname }}</b>: {{ or .Annotations.summary "no summary" | reReplaceAll "(?s)^(.{120}).+$" "${1}…" }}
 {{- with .Labels.dag_id }}
-dag <code>{{ . | html }}</code>{{ end }}
-{{- with .Labels.task_id }} task <code>{{ . | html }}</code>{{ end }}
+dag <code>{{ . }}</code>{{ end }}
+{{- with .Labels.task_id }} task <code>{{ . }}</code>{{ end }}
 {{- with .Annotations.description }}
-{{ . | html }}{{ end }}
-{{ end -}}
+{{- if eq $n 1 }}
+{{ reReplaceAll "(?s)^(.{1000}).+$" "${1}…" . }}
+{{- else if le $n 3 }}
+{{ reReplaceAll "(?s)^(.{600}).+$" "${1}…" . }}
+{{- end }}
+{{- end }}
+{{ end }}{{ end -}}
+{{ if gt $n 10 }}
+{{ $n }} alerts in this group; the first 10 are listed. All of them are in the Alertmanager UI.
+{{- end }}
 {{- end }}

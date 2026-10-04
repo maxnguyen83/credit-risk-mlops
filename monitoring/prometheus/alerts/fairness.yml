@@ -59,18 +59,16 @@ groups:
           description: >-
             The widest gap in intervention rate between protected groups is
             {{ $value | printf "%.3f" }}, above the 0.05 demographic-parity gate
-            the pipeline enforces at training time, sustained for 15 minutes.
-            The API is up, errors are at zero and latency is inside budget:
-            there is nothing to restart. Known trade-off: normal traffic
-            measured a gap of 0.046, so this limit has 0.004 of headroom and
-            the alert can flap -- fire, resolve, fire again -- on an ordinary
-            change in who applies. Read the per-group rates with
-            `credit_selection_rate` and compare the traffic mix, the serving
-            model version and THRESHOLD_POLICY with the last quiet period, then
-            hand it to compliance, not the on-call engineer, with what you
-            found. If only the mix moved and it is flapping, a time-boxed
-            Alertmanager silence that names the reason stops the noise and
-            leaves the alert visible in the UI. Do not edit the threshold: it is
-            the registration gate's, and changing it is a compliance decision
-            that moves both. If the model or the policy changed, or the gap
-            keeps widening, treat it as a regression.
+            the pipeline enforces at registration, for 15 minutes. API, errors
+            and latency are fine: there is nothing to restart. Known trade-off:
+            normal traffic measured a gap of 0.046, so this limit has 0.004 of
+            headroom and the alert can flap -- fire, resolve, fire again -- on
+            an ordinary change in who applies. Compare `credit_selection_rate`
+            per group, the traffic mix, the serving model version and
+            THRESHOLD_POLICY with the last quiet period, and hand what you found
+            to compliance, not the on-call engineer. If only the mix moved and
+            it flaps, a time-boxed Alertmanager silence that names the reason
+            stops the noise and keeps the alert visible. Do not edit the
+            threshold: it is the registration gate's, and moving it is a
+            compliance decision that moves both. If the model or the policy
+            changed, or the gap keeps widening, treat it as a regression.

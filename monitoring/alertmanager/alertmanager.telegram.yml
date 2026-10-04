@@ -43,14 +43,15 @@ route:
   routes:
     # --- pipeline failures --------------------------------------------------
     # Posted by the Airflow DAG's on_failure_callback straight to
-    # /api/v2/alerts, with labels severity=critical, dag_id and task_id. First
-    # in the list because it is severity=critical too, and the first matching
-    # route wins: this keeps it out of the `critical` receiver, whose resolved
-    # messages would be wrong for it (see the `pipeline` receiver).
+    # /api/v2/alerts, with labels severity=critical, dag_id and task_id and an
+    # end time 24h out; the DAG's on_success_callback resolves it when a later
+    # run succeeds. First in the list because it is severity=critical too and
+    # the first matching route wins: this gives it per-DAG grouping and a
+    # receiver of its own instead of the `critical` timing.
     #
     # Grouped per DAG, so two tasks failing in the same run arrive as one
     # message. 10s wait: the failure is already final when it is posted, there
-    # is nothing more to collect.
+    # is nothing more to collect. Repeated every 12h while no run has succeeded.
     - receiver: pipeline
       matchers:
         - alertname = "PipelineTaskFailed"
@@ -130,11 +131,13 @@ receivers:
       - <<: *telegram
         disable_notifications: true
 
-  # No resolved message. A pipeline failure is an event, not a state: the
-  # callback posts it once, and Alertmanager times it out after
-  # resolve_timeout. A "RESOLVED" five minutes later would claim the pipeline
-  # was fixed when nothing happened at all.
+  # Same delivery as `critical`, resolved message included. The DAG resolves
+  # the alert itself when a later run succeeds, so "RESOLVED" here means the
+  # pipeline ran green again. The one case that reads wrong: if no run happens
+  # at all, the alert expires at the 24h end time the failure callback set, and
+  # Alertmanager reports that as resolved too although nothing was fixed. A
+  # receiver of its own so pipeline failures show apart in the UI and can be
+  # sent to another chat by editing this block alone.
   - name: pipeline
     telegram_configs:
       - <<: *telegram
-        send_resolved: false

@@ -49,14 +49,15 @@ route:
   routes:
     # --- pipeline failures --------------------------------------------------
     # Posted by the Airflow DAG's on_failure_callback straight to
-    # /api/v2/alerts, with labels severity=critical, dag_id and task_id. First
-    # in the list because it is severity=critical too, and the first matching
-    # route wins: this keeps it out of the `critical` receiver, whose resolved
-    # messages would be wrong for it (see the `pipeline` receiver).
+    # /api/v2/alerts, with labels severity=critical, dag_id and task_id and an
+    # end time 24h out; the DAG's on_success_callback resolves it when a later
+    # run succeeds. First in the list because it is severity=critical too and
+    # the first matching route wins: this gives it per-DAG grouping and a
+    # receiver of its own instead of the `critical` timing.
     #
     # Grouped per DAG, so two tasks failing in the same run arrive as one
     # message. 10s wait: the failure is already final when it is posted, there
-    # is nothing more to collect.
+    # is nothing more to collect. Repeated every 12h while no run has succeeded.
     - receiver: pipeline
       matchers:
         - alertname = "PipelineTaskFailed"

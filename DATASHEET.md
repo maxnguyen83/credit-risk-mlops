@@ -135,15 +135,23 @@ publication or the UCI entry.
 All steps live in `src/credit_risk/data/` and `src/credit_risk/features/`, and
 each is covered by a test:
 
-1. **Download and verify** — fetch the ZIP from UCI, record its SHA-256, extract
-   the single `.xls` member, convert to Parquet. The Excel reader is needed
-   exactly once; everything downstream reads Parquet.
+1. **Download and verify** — fetch the ZIP from UCI (retrying dropped
+   connections and 5xx answers), record its SHA-256, extract the single `.xls`
+   member, convert to Parquet. The archive digest and the Parquet's own digest
+   go into a sidecar written before the Parquet; a Parquet without a matching
+   sidecar is downloaded again. The Excel reader is needed exactly once;
+   everything downstream reads Parquet.
 2. **Validate** — shape, column set, dtypes, ranges, nulls, category codes. If
    more than 5% of rows fail, the pipeline **stops** rather than training.
+   Rows that fail below that tolerance are **quarantined**: written as received
+   to `data/processed/quarantine.parquet` with the checks they failed, counted
+   in the manifest, and left out of every split. The published file has none.
 3. **Clean** — rename `PAY_0` to `PAY_1` and the target to `default_next_month`;
    fold undocumented category codes; derive `AGE_GROUP` (35 and under / over 35).
 4. **Split** — six deterministic batches of 5,000 by sorted `ID`, with a
    manifest recording a hash per split so reruns are verifiably identical.
+   Batches are assigned before quarantine, so a set-aside row leaves a gap in its
+   own batch rather than moving other accounts between batches.
 5. **Feature engineering** — utilisation ratios, payment ratios, delinquency
    counts and runs, trends. Every division is guarded; a NaN reaching the model
    is a silent wrong answer rather than a crash.
@@ -159,6 +167,26 @@ change. We do it because an orchestration layer that only ever copies one file
 demonstrates nothing — and we state it here, in the README, and in the
 presentation, because a simulated arrival presented as a real one would be a
 fabricated result.
+
+**`ID` is not time, and the splits do not share a base rate.** The file has no
+date column; ordering by `ID` is the only deterministic order available, and
+nothing documents how IDs were assigned. The batches therefore differ in risk,
+measured on the published file:
+
+| Split | Batches | Rows | Default rate |
+|---|---|---|---|
+| train | 1–4 | 20,000 | 22.8% |
+| test | 5 | 5,000 | 20.4% |
+| serving pool | 6 | 5,000 | 21.2% |
+| whole file | — | 30,000 | 22.1% |
+
+Two consequences. Held-out metrics are measured on a population with a lower
+base rate than the training data (the recall ceiling in the model card uses the
+test split's 20.4% for that reason). And no result here says anything about how
+the model behaves as time passes: a random or stratified split would equalise
+the rates, and a real temporal hold-out is impossible without dates. We keep the
+ID split because it is reproducible and states its own limits, and we record
+this as a property of the simulation rather than of the population.
 
 ---
 

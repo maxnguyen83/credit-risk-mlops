@@ -126,6 +126,9 @@ flowchart LR
     B -->|"bad rows over 5 percent"| X(["DAG FAILS
     nothing is trained"])
     B -->|ok| C["clean_and_split"]
+    C -->|"rows failing an error check"| Q(["quarantine.parquet
+    counted in the manifest,
+    never trained on"])
     C --> D["build_features"]
     D --> E["train_candidates"]
     E --> F["evaluate_and_gate"]
@@ -143,7 +146,45 @@ Two edges carry most of the design intent.
 **`validate_raw` can fail the DAG.** Training on unchecked data produces a model
 that is confidently wrong, and the failure surfaces weeks later in production
 rather than immediately in the pipeline. Failing loudly at ingestion is cheaper
-than debugging a bad model.
+than debugging a bad model. The report is pushed to XCom (key
+`validation_report`) before the task checks the exit status, so a failed run
+keeps its evidence.
+
+**Under the 5% tolerance, bad rows are set aside, not trained on.**
+`clean_and_split` assigns batches over the whole file, then moves every row that
+failed an error-severity check to `data/processed/quarantine.parquet`, as
+received and with the failed checks named. The manifest records
+`quarantined_rows` and a count per check. Kept rows stay in the batch they
+arrived in, so a bad row in batch 1 does not change who is in the test set. The
+published file has no such rows, and its split hashes are unchanged.
+
+**Only transient failures are retried.** `download_raw` retries connection
+errors, timeouts and 408/425/429/5xx itself (4 attempts, 2/4/8 s backoff). If
+the archive stays down it exits 75 (`EX_TEMPFAIL`), the one exit code
+`run_module` maps to a retryable `AirflowException`; Airflow then applies the
+DAG's two retries. Every other non-zero exit is a defect and fails the task
+without a retry.
+
+**A failed run raises an alert.** The DAG's `on_failure_callback` posts one
+alert per failed task to Alertmanager's v2 API (`ALERTMANAGER_ALERTS_URL`,
+default `http://alertmanager:9093/api/v2/alerts`) with
+`alertname=PipelineTaskFailed`, `severity=critical`, `dag_id` and `task_id`. It
+stays firing for 24 hours unless a successful run resolves it first
+(`on_success_callback`). Neither callback can raise.
+
+**The raw parquet is trusted only with its sidecar.** The download writes the
+parquet and its provenance sidecar (archive SHA-256 plus the parquet's own
+digest) to temporary files and renames them into place, sidecar first. A
+parquet with no sidecar, or one its sidecar does not describe, is downloaded
+again, so a crash cannot leave the manifest with `source_sha256: null`.
+
+**Batches are cut by `ID`, and `ID` is not time.** The file has no date
+column, so the six "arrivals" are ID ranges. They are not equally risky: the
+default rate is 22.8% in train (batches 1–4), 20.4% in test (batch 5) and 21.2%
+in the serving pool (batch 6), against 22.1% overall. Test metrics are measured
+on a population with a lower base rate than the one the model was fitted on,
+and none of this is evidence about behaviour over time. We keep the ID split
+because it is deterministic and documented; DATASHEET.md states the same.
 
 **`evaluate_and_gate` can refuse to register.** A candidate that beats the
 baseline on PR-AUC but breaches the fairness gate is **not promoted**. The
@@ -282,8 +323,9 @@ SQLite metadata DB.
 **Rejected.** The canonical CeleryExecutor deployment (webserver, scheduler,
 worker, redis, metadata DB). Also rejected: no orchestrator at all.
 
-**Why.** We want scheduling, retries with exponential backoff, a run history UI,
-and backfill available when we need it. Standalone gives all of them for **one**
+**Why.** We want scheduling, retries with exponential backoff (applied to
+transient failures only, see §3.1), a run history UI, and backfill available
+when we need it. Standalone gives all of them for **one**
 container. Backfill is deliberately disabled (`catchup=False`): with `@daily`
 from 2026-01-01, turning it on would queue one training run for every day since
 then, over 270 of them, one after another on the SequentialExecutor.

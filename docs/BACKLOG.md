@@ -64,4 +64,9 @@ community images stopped being pullable. `REQUIREMENTS.md`; a `DagBag` test for 
 DAG plus `make dag-test`; `disallow_untyped_defs = true` in mypy. The capacity
 threshold is tagged onto each model version at registration and the API decides
 at it, with a `tag-threshold` backfill for versions registered earlier (was P3 #1;
-version 2 still needs the backfill run against the live registry).
+version 2 still needs the backfill run against the live registry). Pipeline
+hardening (P1): rows failing an error-level check are quarantined instead of
+trained on; the download retries transient failures and exits 75 so Airflow
+retries the task; the raw parquet is trusted only with a sidecar that describes
+it; `validate_raw` keeps its report in XCom when it fails; a failed run posts
+`PipelineTaskFailed` to Alertmanager.

@@ -1,0 +1,54 @@
+# Prometheus configuration for the credit-risk stack.
+#
+# Scrape interval is 5s, which is far tighter than a real deployment would run.
+# The reason is the demo: an alert with `for: 1m` needs several samples inside
+# its window before it can move to Firing, and a 15s interval leaves four. At 5s
+# the state transitions happen while someone is still looking at the screen.
+
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  # Rules are evaluated on the same cadence so an alert cannot lag the graph it
+  # is drawn next to -- the first question in a demo is always "why is the panel
+  # red but the alert green?".
+  evaluation_interval: 5s
+  external_labels:
+    stack: credit-risk-mlops
+
+rule_files:
+  # One file per audience. api.yml wakes the on-call engineer, model.yml wakes
+  # whoever owns the model, fairness.yml is read by compliance. Splitting them
+  # is not cosmetic: it is how you route without re-reading every expression.
+  - /etc/prometheus/alerts/api.yml
+  - /etc/prometheus/alerts/model.yml
+  - /etc/prometheus/alerts/fairness.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # The job name is part of the contract: ApiDown matches on
+  # `up{job="credit-api"}`, so renaming this job silently disables the one alert
+  # that tells you the service is gone.
+  - job_name: credit-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - credit-api:8000
+        labels:
+          component: serving
+    # Port 8000 is the container port. The host maps it to 18000 to stay clear
+    # of the other lab stacks on this machine; inside the compose network the
+    # container port is the one that exists.
+
+  # Prometheus scraping itself. Cheap, and it is the only way to tell "no data
+  # because the target is down" from "no data because Prometheus is down".
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+        labels:
+          component: monitoring

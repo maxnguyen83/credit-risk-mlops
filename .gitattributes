@@ -1,0 +1,5 @@
+# Shell scripts run inside Linux containers and on the CI runners. A CRLF
+# checkout (Windows with core.autocrlf=true) would leave a carriage return at
+# the end of every line, which sh reads as part of the command -- for the
+# Alertmanager entrypoint, a container that never starts.
+*.sh text eol=lf

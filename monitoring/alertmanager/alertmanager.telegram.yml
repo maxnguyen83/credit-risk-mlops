@@ -1,0 +1,143 @@
+# Alertmanager routing -- the config the stack runs when Telegram is set up.
+#
+# Never started directly: entrypoint.sh copies this file to /tmp, fills in the
+# chat id from the secrets mount, checks the result with amtool and only then
+# starts Alertmanager on it. Any problem on the way and it starts on
+# alertmanager.yml instead, with a WARNING in the container log. Turning it on
+# is docs/ALERTING.md.
+#
+# Secrets stay out of this file. The bot token is read by Alertmanager itself
+# from bot_token_file, on every notification, so replacing the token needs no
+# restart. The chat id has no *_file option in Alertmanager v0.27, which is why
+# the entrypoint substitutes it -- in a copy inside the container, never here.
+#
+# Everything from `route:` down to `receivers:` is byte-identical to
+# alertmanager.yml (tests/test_config.sh fails CI when it is not): change the
+# routing there and copy the section across. What differs is the receivers --
+# same names, real integrations.
+
+global:
+  resolve_timeout: 5m
+
+templates:
+  # Absolute: the running copy lives in /tmp, and relative template paths are
+  # resolved against the config file's own directory.
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  # Fallback for anything no child route matches, e.g. an alert from a new tool
+  # that carries no severity label. Kept silent, so a stray sender cannot page.
+  receiver: "null"
+
+  # Group by the alert and its severity, not by instance: there is one API
+  # container, so grouping by instance would produce one message per alert
+  # anyway.
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  # Re-notify about a still-firing alert every 4 hours. Shorter and a weekend
+  # incident trains everyone to mute the chat; longer and a genuine ongoing
+  # problem falls off the bottom of it.
+  repeat_interval: 4h
+
+  routes:
+    # --- pipeline failures --------------------------------------------------
+    # Posted by the Airflow DAG's on_failure_callback straight to
+    # /api/v2/alerts, with labels severity=critical, dag_id and task_id and an
+    # end time 24h out; the DAG's on_success_callback resolves it when a later
+    # run succeeds. First in the list because it is severity=critical too and
+    # the first matching route wins: this gives it per-DAG grouping and a
+    # receiver of its own instead of the `critical` timing.
+    #
+    # Grouped per DAG, so two tasks failing in the same run arrive as one
+    # message. 10s wait: the failure is already final when it is posted, there
+    # is nothing more to collect. Repeated every 12h while no run has succeeded.
+    - receiver: pipeline
+      matchers:
+        - alertname = "PipelineTaskFailed"
+      group_by: ["alertname", "dag_id"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 12h
+
+    # --- critical: something is not serving. Notify fast, repeat hourly. ----
+    # ApiDown, ModelNotLoaded.
+    - receiver: critical
+      matchers:
+        - severity = "critical"
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+
+    # --- warning: it serves, but an SLO, a drift or a fairness limit is
+    # breached. Read during working hours and acted on deliberately.
+    #
+    # Grouped by component (serving / model / fairness), which is also who acts
+    # on it: the on-call engineer, the model owner, compliance. FeatureDriftHigh
+    # for three features and HighRiskShareShift arrive as one model message --
+    # they are usually one story. The longer wait collects a burst first.
+    - receiver: warning
+      matchers:
+        - severity = "warning"
+      group_by: ["severity", "component"]
+      group_wait: 2m
+      group_interval: 10m
+      repeat_interval: 4h
+
+    # --- info: dashboard material. Routed explicitly to `null` rather than left
+    # to fall through, so the intent is written down instead of inferred.
+    - receiver: "null"
+      matchers:
+        - severity = "info"
+
+inhibit_rules:
+  # If the API is down, every model and fairness rule reading its metrics goes
+  # stale or fires on last-known values. Suppressing them keeps the message to
+  # the one fact that matters: the service is gone.
+  - source_matchers:
+      - alertname = "ApiDown"
+    target_matchers:
+      - severity =~ "warning|info"
+    equal: ["stack"]
+
+  # ModelNotLoaded makes every prediction a 503, which also trips HighErrorRate.
+  # The cause is more useful than the symptom.
+  - source_matchers:
+      - alertname = "ModelNotLoaded"
+    target_matchers:
+      - alertname = "HighErrorRate"
+    equal: ["stack"]
+
+receivers:
+  - name: "null"
+
+  # Pages. Sends a resolved message too, so whoever was paged knows it is over.
+  - name: critical
+    telegram_configs:
+      - &telegram
+        bot_token_file: /run/secrets/alertmanager/telegram_bot_token
+        # Placeholder, kept a valid integer so this file passes amtool on its
+        # own. entrypoint.sh replaces this line from telegram_chat_id; never
+        # write a real chat id here.
+        chat_id: 1 # @TELEGRAM_CHAT_ID@
+        parse_mode: HTML
+        message: '{{ template "credit.telegram.message" . }}'
+        send_resolved: true
+
+  # Same chat, delivered silently: it shows up, it does not buzz. A warning is
+  # read during working hours, not at 3am.
+  - name: warning
+    telegram_configs:
+      - <<: *telegram
+        disable_notifications: true
+
+  # Same delivery as `critical`, resolved message included. The DAG resolves
+  # the alert itself when a later run succeeds, so "RESOLVED" here means the
+  # pipeline ran green again. The one case that reads wrong: if no run happens
+  # at all, the alert expires at the 24h end time the failure callback set, and
+  # Alertmanager reports that as resolved too although nothing was fixed. A
+  # receiver of its own so pipeline failures show apart in the UI and can be
+  # sent to another chat by editing this block alone.
+  - name: pipeline
+    telegram_configs:
+      - <<: *telegram

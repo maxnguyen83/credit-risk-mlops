@@ -1,0 +1,74 @@
+# Fairness alerts.
+#
+# This is the file worth reading twice. Everything in api.yml describes a way
+# the service can be broken that a normal web service can also be broken in:
+# it is down, it is erroring, it is slow. The rule below describes a failure
+# with none of those symptoms.
+#
+# When FairnessGapExceeded fires, `up` is 1, the error ratio is 0, p95 latency
+# is inside its budget and every request returns 200. Every dashboard an
+# ordinary on-call rotation looks at is green. And the system is discriminating
+# between men and women in who gets called by the collections team -- which is
+# both the thing consumer-credit regulation prohibits and the thing no amount
+# of uptime monitoring will ever surface.
+#
+# That is the entire argument for ML-specific observability, stated as a rule
+# file rather than as a slide.
+
+groups:
+  - name: credit-fairness
+    interval: 15s
+    rules:
+      - alert: FairnessGapExceeded
+        # Demographic parity difference, computed live over the rolling window of
+        # served requests, rather than offline in a notebook nobody re-runs.
+        # 0.05 is the same threshold the training pipeline gates on, so a model
+        # that passed the gate and then breaches it in production is telling you
+        # the serving population differs from the evaluation population.
+        #
+        # max() - min() over all groups, not male-minus-female: the expression
+        # keeps working when AGE_GROUP or EDUCATION is added as a second
+        # monitored attribute, and it cannot go negative and quietly stop firing.
+        #
+        # What keeps this honest is on the serving side, not here: a group is
+        # only published once it holds SELECTION_RATE_MIN_SAMPLES slots of the
+        # rolling window. Without that floor a single request from a rare group
+        # -- one malformed SEX field is enough -- publishes exactly 0.0 or 1.0,
+        # min() takes it, and this rule reports a discrimination incident that
+        # is really a sample of one. The consequence to know when reading a
+        # dashboard: a heavily skewed traffic mix makes the minority series
+        # disappear rather than turn red. That is the monitor declining to
+        # measure what it cannot measure.
+        #
+        # The margin is thin, by choice. On the running stack the gap measured
+        # 0.046 under the normal arrival mix (male 0.128, female 0.082): 0.004
+        # below this threshold. It stays at 0.05 because that is the
+        # registration gate's limit -- one policy, enforced at training time and
+        # in production -- and the price is that an ordinary change in who
+        # applies can carry the gap across the line and back, so this alert can
+        # flap. Do not widen it here to make it quiet: a number here that differs
+        # from the gate's is two policies, and nobody decided the second one.
+        # ETHICS.md section 4 has the reasoning and what to do when it flaps.
+        expr: (max(credit_selection_rate) - min(credit_selection_rate)) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: fairness
+        annotations:
+          summary: "Selection rate gap between protected groups exceeds 0.05"
+          description: >-
+            The widest gap in intervention rate between protected groups is
+            {{ $value | printf "%.3f" }}, above the 0.05 demographic-parity gate
+            the pipeline enforces at registration, for 15 minutes. API, errors
+            and latency are fine: there is nothing to restart. Known trade-off:
+            normal traffic measured a gap of 0.046, so this limit has 0.004 of
+            headroom and the alert can flap -- fire, resolve, fire again -- on
+            an ordinary change in who applies. Compare `credit_selection_rate`
+            per group, the traffic mix, the serving model version and
+            THRESHOLD_POLICY with the last quiet period, and hand what you found
+            to compliance, not the on-call engineer. If only the mix moved and
+            it flaps, a time-boxed Alertmanager silence that names the reason
+            stops the noise and keeps the alert visible. Do not edit the
+            threshold: it is the registration gate's, and moving it is a
+            compliance decision that moves both. If the model or the policy
+            changed, or the gap keeps widening, treat it as a regression.

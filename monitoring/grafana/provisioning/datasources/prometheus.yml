@@ -1,0 +1,26 @@
+# Datasource provisioning. Nobody clicks "Add data source" in this project --
+# a dashboard that only works after a manual setup step is a dashboard that is
+# broken on a fresh machine.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Pinned uid. The dashboard JSON files reference this string, so it is part
+    # of the contract between this file and monitoring/grafana/dashboards/*.
+    # Letting Grafana generate one gives every environment a different uid and
+    # every provisioned dashboard an empty panel.
+    uid: credit-prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    # Read-only in the UI: the file on disk is the source of truth, and a change
+    # made by clicking would be silently reverted on the next restart anyway.
+    editable: false
+    jsonData:
+      # Matches the scrape interval in prometheus.yml. Grafana uses it as the
+      # floor for $__rate_interval, which is what stops rate() over a 5s series
+      # from returning gaps on a zoomed-in graph.
+      timeInterval: 5s
+      httpMethod: POST

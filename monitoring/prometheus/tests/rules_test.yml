@@ -1,0 +1,126 @@
+# Unit tests for the alert rules, run with
+#   promtool test rules monitoring/prometheus/tests/rules_test.yml
+# (CI runs it in the `alert rules` job, with the promtool from the same
+# prom/prometheus image docker-compose.yml deploys).
+#
+# Each alert below has a case that must fire and a case that must not. Firing
+# is asserted on the ALERTS series, which carries the labels but not the
+# annotation text, so rewording a description does not break a test. A rule
+# that has only ever been seen silent is untested, and so is one that has only
+# ever been seen firing: FairnessGapExceeded did not fire in any demo scenario,
+# so these synthetic series are the only evidence its expression can.
+
+rule_files:
+  - ../alerts/api.yml
+  - ../alerts/model.yml
+  - ../alerts/fairness.yml
+
+evaluation_interval: 15s
+
+tests:
+  # ------------------------------------------------ FairnessGapExceeded
+  # A 0.06 gap (0.13 against 0.07) held for 20 minutes: still pending at 10m,
+  # firing once the 15m `for:` has run out.
+  - interval: 1m
+    input_series:
+      - series: 'credit_selection_rate{group="sex_male"}'
+        values: '0.13x20'
+      - series: 'credit_selection_rate{group="sex_female"}'
+        values: '0.07x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="FairnessGapExceeded"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="FairnessGapExceeded", alertstate="pending", component="fairness", severity="warning"}'
+            value: 1
+      - expr: ALERTS{alertname="FairnessGapExceeded"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="FairnessGapExceeded", alertstate="firing", component="fairness", severity="warning"}'
+            value: 1
+
+  # A 0.03 gap for the same 20 minutes is inside the 0.05 policy and stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'credit_selection_rate{group="sex_male"}'
+        values: '0.13x20'
+      - series: 'credit_selection_rate{group="sex_female"}'
+        values: '0.10x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FairnessGapExceeded
+        exp_alerts: []
+
+  # ------------------------------------------------- HighRiskShareShift
+  # A freshly started API with no traffic. serving/metrics.py publishes the
+  # share as NaN below 50 scored requests, and every comparison with NaN is
+  # false, so twenty idle minutes against a 0.124 baseline raise nothing.
+  - interval: 1m
+    input_series:
+      - series: 'credit_high_risk_share'
+        values: 'NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN'
+      - series: 'credit_baseline_high_risk_share'
+        values: '0.124x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HighRiskShareShift
+        exp_alerts: []
+
+  # The same idle API before that fix exported 0, and this is the false
+  # positive it produced: |0 - 0.124| > 0.10 for longer than 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'credit_high_risk_share'
+        values: '0x20'
+      - series: 'credit_baseline_high_risk_share'
+        values: '0.124x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="HighRiskShareShift", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="HighRiskShareShift", alertstate="firing", component="model", severity="warning"}'
+            value: 1
+
+  # A real shift: the model flags 30% of live traffic against 12.4% at
+  # registration.
+  - interval: 1m
+    input_series:
+      - series: 'credit_high_risk_share'
+        values: '0.30x20'
+      - series: 'credit_baseline_high_risk_share'
+        values: '0.124x20'
+    promql_expr_test:
+      - expr: ALERTS{alertname="HighRiskShareShift", alertstate="firing"}
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="HighRiskShareShift", alertstate="firing", component="model", severity="warning"}'
+            value: 1
+
+  # No baseline installed yet (the gauge reads 0): no baseline, no alert.
+  - interval: 1m
+    input_series:
+      - series: 'credit_high_risk_share'
+        values: '0.30x20'
+      - series: 'credit_baseline_high_risk_share'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HighRiskShareShift
+        exp_alerts: []
+
+  # ----------------------------------------------------- ModelNotLoaded
+  # Degraded for three minutes: the 2m `for:` has run out.
+  - interval: 30s
+    input_series:
+      - series: 'credit_model_loaded{instance="credit-api:8000", job="credit-api"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ModelNotLoaded
+        exp_alerts: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="ModelNotLoaded", alertstate="firing"}
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ALERTS{alertname="ModelNotLoaded", alertstate="firing", component="model", instance="credit-api:8000", job="credit-api", severity="critical"}'
+            value: 1

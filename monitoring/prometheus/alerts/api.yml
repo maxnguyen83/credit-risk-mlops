@@ -1,0 +1,147 @@
+# Service-level alerts: the ones a conventional web service would also have.
+#
+# Every rule carries a `for:`. A rule without one fires on a single scrape, and
+# a single scrape is noise -- one slow GC pause, one container restart, one
+# blip during a deploy. The `for` duration is the shortest interval over which
+# the condition is still worth a human's attention.
+
+groups:
+  - name: credit-api.availability
+    interval: 15s
+    rules:
+      - alert: ApiDown
+        # `up` is written by Prometheus itself, not by the app, so this still
+        # fires when the process is wedged badly enough not to serve /metrics.
+        expr: up{job="credit-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: serving
+        annotations:
+          summary: "credit-api is not answering scrapes"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for over a
+            minute. No predictions are being served and no other alert in this
+            file can evaluate, because every one of them reads a metric that
+            this target publishes. Check `docker compose ps` and the container
+            logs before looking anywhere else.
+
+  - name: credit-api.errors
+    interval: 15s
+    rules:
+      - alert: HighErrorRate
+        # Denominator is errors + predictions, i.e. every request that reached
+        # a terminal state. With no traffic this is 0/0, which PromQL evaluates
+        # to NaN and NaN fails the comparison -- deliberate: an idle service has
+        # no error rate, and paging on one is how alerts get muted.
+        expr: |
+          sum(rate(credit_errors_total[5m]))
+            /
+          (sum(rate(credit_errors_total[5m])) + sum(rate(credit_predictions_total[5m])))
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: serving
+        annotations:
+          summary: "credit-api error ratio above 5%"
+          description: >-
+            {{ $value | humanizePercentage }} of terminal requests over the last
+            five minutes ended in an error, against a 1% target. Break it down
+            by reason with `sum by (reason) (rate(credit_errors_total[5m]))`:
+            a spike in `validation` is a caller sending bad payloads, a spike in
+            `model_not_loaded` is this service's own problem. (`validation` is
+            the metric label; `validation_error` is the code in the JSON body
+            the caller sees. Querying the second returns nothing.)
+
+  - name: credit-api.latency
+    interval: 15s
+    rules:
+      - alert: SlowPredictions
+        # histogram_quantile over the _bucket series; averaging latency would
+        # hide exactly the tail this SLO is written about. PromQL regexes are
+        # fully anchored, so `.*predict` matches /api/v1/predict and the bare
+        # /predict route but NOT /api/v1/predict/batch, which has its own,
+        # much larger, latency budget.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(credit_prediction_latency_seconds_bucket{endpoint=~".*predict"}[5m])
+            )
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: serving
+        annotations:
+          summary: "p95 /predict latency above the 100ms target"
+          description: >-
+            p95 latency is {{ $value | humanizeDuration }} over the last five
+            minutes, against a 100ms target. Sustained for ten minutes, so this
+            is not a single slow request. Usual causes, in order of likelihood:
+            oversized batch payloads, a feature-build step doing per-row work,
+            or the container hitting its CPU limit.
+
+      - alert: SlowBatchPredictions
+        # The "much larger budget" the rule above refers to. Without this rule
+        # that comment described a budget nothing enforced, and the one traffic
+        # mode that drives batch latency (`traffic.py --slow`) could not move
+        # any alert at all -- it posts to /predict/batch, which the regex above
+        # deliberately excludes.
+        #
+        # 500ms rather than a multiple of the single-record target: the nightly
+        # core-banking path sends up to max_batch_size accounts per call and is
+        # judged on finishing the portfolio, not on per-call latency. 500ms is
+        # also near the ceiling this histogram can resolve -- the top finite
+        # bucket is 1.0s, so histogram_quantile saturates there and a threshold
+        # at or above 1.0 would be a rule that can never fire.
+        #
+        # Measured, so the budget is not a guess: a 1000-record batch costs
+        # ~55ms served one at a time and holds p95 under 100ms at 12 calls/s.
+        # At `traffic.py --slow`'s default 20 calls/s a single worker is
+        # oversubscribed and 235 of 240 batches came back above 500ms.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(credit_prediction_latency_seconds_bucket{endpoint=~".*predict/batch"}[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: serving
+        annotations:
+          summary: "p95 /predict/batch latency above the 500ms budget"
+          description: >-
+            p95 batch latency is {{ $value | humanizeDuration }} against a 500ms
+            budget, sustained for ten minutes. Check the batch size first --
+            latency here is roughly linear in records per call, so this usually
+            means callers grew their payloads rather than that the service
+            regressed. `credit_predictions_total` divided by the request count
+            is the quickest way to see the average batch size.
+
+      - alert: SlowExplanations
+        # Info, not warning. SHAP is expected to be slow; this exists so that
+        # when someone asks "is /explain getting worse?" there is an answer,
+        # not so anyone gets woken up.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(credit_prediction_latency_seconds_bucket{endpoint=~".*explain"}[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: info
+          component: serving
+        annotations:
+          summary: "p95 /explain latency above the 500ms target"
+          description: >-
+            p95 explanation latency is {{ $value | humanizeDuration }} against a
+            500ms target. Compare SHAP against LIME with
+            `histogram_quantile(0.95, sum by (le, method) (rate(credit_explain_duration_seconds_bucket[5m])))`
+            -- if only the shap series moved, the explainer is being rebuilt per
+            request instead of being cached alongside the model.

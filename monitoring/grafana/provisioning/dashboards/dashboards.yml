@@ -1,0 +1,22 @@
+# Dashboard provisioning. The three JSON files under
+# monitoring/grafana/dashboards/ are loaded from disk at startup, so the stack
+# comes up with the dashboards already there and already populated.
+
+apiVersion: 1
+
+providers:
+  - name: credit-risk
+    orgId: 1
+    folder: Credit Risk
+    type: file
+    # UI edits are not persisted back to disk. Turning this on would let a
+    # demo-time tweak survive until the next `docker compose up`, then vanish
+    # with no record of what changed -- worse than not being editable at all.
+    allowUiUpdates: false
+    # A dashboard removed from disk is removed from Grafana, so the repo cannot
+    # drift into being a subset of what is actually deployed.
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,19 @@
+# MLflow tracking server. Kept separate from the serving image because it needs
+# the Postgres driver and boto3 but none of the ML libraries -- there is no
+# reason for the tracking server to carry LightGBM and SHAP.
+FROM python:3.12-slim
+
+ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip \
+ && pip install "mlflow==2.19.0" "sqlalchemy==2.0.36" \
+                "psycopg2-binary==2.9.10" "boto3==1.35.90"
+
+RUN useradd --create-home --uid 10002 mlflowuser
+USER mlflowuser
+WORKDIR /mlflow
+EXPOSE 5000

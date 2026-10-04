@@ -142,7 +142,8 @@ def _fetch(
 
     A connection error, a timeout, a body cut off mid-transfer and the statuses
     in :data:`TRANSIENT_STATUS` are retried with exponential backoff. Any other
-    HTTP error raises :class:`DownloadError` at once. Running out of attempts
+    HTTP error, a TLS failure and a proxy error raise :class:`DownloadError` at
+    once. Running out of attempts
     raises :class:`TransientDownloadError`, which the CLI reports as
     :data:`EXIT_TRANSIENT` so the scheduler retries the task later.
     """
@@ -152,6 +153,11 @@ def _fetch(
             response = requests.get(
                 url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
             )
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as exc:
+            # Subclasses of ConnectionError, caught first on purpose: a
+            # certificate that does not verify or a proxy that refuses us is
+            # configuration, and it is the same on every attempt.
+            raise DownloadError(f"{type(exc).__name__} fetching {url}: {exc}") from exc
         except (
             requests.ConnectionError,
             requests.Timeout,

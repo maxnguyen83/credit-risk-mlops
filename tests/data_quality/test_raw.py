@@ -399,6 +399,27 @@ class TestTransientFailures:
         assert not isinstance(excinfo.value, TransientDownloadError)
         assert len(calls) == 1
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            requests.exceptions.SSLError("certificate verify failed"),
+            requests.exceptions.ProxyError("407 Proxy Authentication Required"),
+        ],
+        ids=["ssl", "proxy"],
+    )
+    def test_a_certificate_or_proxy_error_is_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        """Both subclass ConnectionError, but a bad certificate or a misconfigured
+        proxy is the same on the fourth attempt as on the first."""
+        calls = _scripted_get(monkeypatch, [error, _Response(200, b"zip")])
+
+        with pytest.raises(DownloadError, match=type(error).__name__) as excinfo:
+            download_module._fetch(schema.DATASET_URL, sleep=lambda s: None)
+
+        assert not isinstance(excinfo.value, TransientDownloadError)
+        assert len(calls) == 1
+
     def test_a_source_that_stays_down_is_reported_as_transient(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

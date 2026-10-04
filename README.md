@@ -33,7 +33,7 @@ operate:
   composed stack (plus a release workflow that publishes the image on a `v*` tag)
 - **CD** onto the machine that runs the stack: a self-hosted runner deploys every
   commit CI passes on `main`, and fails the deploy unless the API serves the
-  model the registry holds in Production
+  version the registry's `champion` alias names
 
 The interesting claim of the project is in that fourth bullet, and there is a
 one-command demo of it below.
@@ -92,7 +92,7 @@ make ps                         # wait for mlflow and airflow to report healthy
 
 make dag-test                   # the pipeline once: download, validate, split,
                                 # train, gate, register, report
-docker compose restart credit-api   # the API loads the Production model at startup
+docker compose restart credit-api   # the API loads the champion at startup
 make ps                         # credit-api turns healthy once a model is loaded
 
 make smoke                      # prove the running stack answers correctly
@@ -297,8 +297,8 @@ flowchart LR
     AF -->|params, metrics, artifacts| MLF[mlflow]
     MLF --> PG[(postgres)]
     MLF --> OBJ[(objectstore<br/>SeaweedFS)]
-    AF -->|register only if<br/>perf AND fairness gates pass| MLF
-    API[credit-api<br/>FastAPI] -->|models:/credit-risk/Production| MLF
+    AF -->|register only if<br/>perf AND fairness gates pass;<br/>promote only if not worse<br/>than the champion| MLF
+    API[credit-api<br/>FastAPI] -->|models:/credit-risk@champion| MLF
     CLIENT[risk officer<br/>batch job] --> API
     PROM[prometheus] -->|scrape 5s| API
     PROM --> AM[alertmanager]
@@ -409,21 +409,59 @@ When CI passes on a push to `main` it:
    `docker compose up -d`; the volumes, and with them the registry, are kept;
 2. waits for the Postgres, object store, MLflow and Airflow healthchecks,
    fetches the dataset if it is missing, and runs the pipeline once only if
-   nothing is in Production;
-3. restarts the API so it loads the current Production model, and waits for
-   every service to report ready;
+   the registry serves nothing yet (no `champion` alias, nothing in Production);
+3. restarts the API so it loads the current champion, and waits for every
+   service to report ready;
 4. runs `scripts/verify_deploy.py`, which fails the deploy unless the version
-   MLflow holds in Production, the version `/health` reports and the version
-   that scores `docs/examples/high_risk.json` are the same.
+   the `champion` alias names (the Production stage when no version carries
+   it), the version `/health` reports and the version that scores
+   `docs/examples/high_risk.json` are the same.
 
-The run summary records the commit, the model version and stage served, and the
-health of every container. Registering the runner, deploying by hand and
-removing the runner are in [`docs/RUNNER.md`](docs/RUNNER.md).
+The run summary records the commit, the model version served and whether the
+alias or the stage named it, and the health of every container. Registering the
+runner, deploying by hand and removing the runner are in
+[`docs/RUNNER.md`](docs/RUNNER.md).
 
 ```bash
 gh workflow run deploy.yml --ref main   # deploy main by hand; refused unless CI passed on it
 make deploy-check                       # on the host: is the API serving the registry's model?
 ```
+
+### Changing the model that serves
+
+The API serves `models:/credit-risk@champion`. When no version carries that
+alias — a registry promoted before aliases were used, like version 2 here — it
+falls back to the version in the Production stage, and `/health` says which one
+answered as `"model_ref": "alias"` or `"stage"`.
+
+Registration decides whether a new model becomes the champion. A candidate that
+passed the performance and fairness gates is compared with the champion on the
+PR-AUC both runs logged on the same held-out split (the runs record its
+`data_test_sha256`). It is promoted when the registry has no champion, or when
+it is no more than `PROMOTION_PR_AUC_TOLERANCE` (0.005) below the champion.
+Otherwise it is registered as the challenger — alias `challenger`, stage
+Staging, and `promotion_decision`/`promotion_reason` tags saying why — and
+nothing changes for traffic until a person decides.
+
+The model is loaded once, at startup, so a promotion reaches traffic only when
+the API restarts. There is no reload endpoint on purpose: an unauthenticated
+call that swaps the model is a bigger risk than a restart. The procedure, on the
+host that runs the stack:
+
+```bash
+# 1. promote: after the DAG has done it, or by hand after reviewing a challenger
+.venv/bin/python -m credit_risk.models.registry set-champion --version <N> --dry-run
+.venv/bin/python -m credit_risk.models.registry set-champion --version <N>
+# 2. restart, so the API resolves the alias again (or: gh workflow run deploy.yml --ref main)
+docker compose restart credit-api
+# 3. verify: registry, /health and a live prediction must agree
+python3 scripts/verify_deploy.py
+curl -s http://127.0.0.1:18000/health | jq '{model_version, model_ref, threshold_source}'
+```
+
+`set-champion` moves the alias, moves the version to Production (archiving the
+previous one), drops its challenger alias, and changes nothing that is already
+so. Rolling back is the same command with the previous version number.
 
 ---
 
@@ -468,9 +506,20 @@ runtime stage.
 
 **`/health` reports `model_loaded: false`.** Nothing is registered yet, or the
 API started before the model was. Run `make dag-test`, then
-`docker compose restart credit-api`: the Production model is loaded once, at
-startup. The API starts in a degraded state on purpose: a service that refuses
-to boot cannot tell you why it is unhappy.
+`docker compose restart credit-api`: the champion is loaded once, at startup.
+The API starts in a degraded state on purpose: a service that refuses to boot
+cannot tell you why it is unhappy.
+
+**`/health` reports `"model_ref": "stage"`.** No version carries the `champion`
+alias, so the API fell back to the version in Production. Versions promoted
+before the alias existed look like this. Run
+`.venv/bin/python -m credit_risk.models.registry set-champion --version <N>`
+with the version `/health` reports, then `docker compose restart credit-api`.
+
+**A newly trained model is not serving.** Look at its version in MLflow: a
+`challenger` alias and a `promotion_reason` tag mean it scored worse than the
+champion beyond the tolerance, or on a different held-out split. Promote it with
+`set-champion` only if that is what you want, then restart the API.
 
 **`/health` reports `"threshold_source": "fallback"`.** The serving version
 carries no `threshold_at_k` tag, so decisions are made at `DECISION_THRESHOLD`

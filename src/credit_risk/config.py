@@ -29,7 +29,17 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = Field(default="http://localhost:15020")
     mlflow_experiment: str = "credit-risk"
     model_name: str = "credit-risk"
+    # The serving model is `models:/<name>@<alias>`. The stage is still set on
+    # promotion and is what serving falls back to when no version carries the
+    # alias -- a registry populated before aliases were used.
+    model_alias: str = "champion"
     model_stage: str = "Production"
+    # A candidate that passed the gate replaces the champion only if its
+    # held-out PR-AUC is no more than this below the champion's; otherwise it
+    # is registered as the challenger for someone to review. 0.005 is about half
+    # the fold-to-fold spread of PR-AUC in cross-validation (0.0096 for version
+    # 2): a retrain that only moved by noise still ships, a real drop waits.
+    promotion_pr_auc_tolerance: float = Field(default=0.005, ge=0.0, le=1.0)
 
     # --- decision policy --------------------------------------------
     # `base` applies one threshold to everyone. `group_aware_equalized_odds`

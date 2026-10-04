@@ -186,23 +186,63 @@ def test_registry_cli_registers_and_promotes_when_the_gate_passes(
             registered=True, model_name="credit-risk", version="7"
         )
 
-    def fake_promote(version, stage, **kwargs):
-        calls["promoted"] = (version, stage)
-        return registry_module.RegistrationDecision(
-            registered=True, model_name="credit-risk", version=str(version), stage=stage
+    def fake_promote(run_id, version, metrics, *, stage=None, **kwargs):
+        calls["promoted"] = (run_id, version, stage, metrics["pr_auc"])
+        verdict = registry_module.PromotionVerdict(True, ["no champion in the registry"])
+        return verdict, registry_module.RegistrationDecision(
+            registered=True,
+            model_name="credit-risk",
+            version=str(version),
+            stage=stage,
+            alias="champion",
         )
 
     monkeypatch.setattr(registry_module, "register_if_passes", fake_register)
-    monkeypatch.setattr(registry_module, "promote", fake_promote)
+    monkeypatch.setattr(registry_module, "promote_or_challenge", fake_promote)
     monkeypatch.setattr(registry_module.mlflow, "set_tracking_uri", lambda uri: None)
 
     code = registry_module.main(["--result", str(artefact)])
 
     assert code == 0
     assert calls["registered_run"] == "abc123"
-    assert calls["promoted"] == ("7", "Production")
+    # Compared with the champion on the PR-AUC the hand-off carries, and
+    # promoted into the configured stage.
+    assert calls["promoted"] == ("abc123", "7", "Production", 0.5668)
     payload = json.loads((artefact.parent / "registration.json").read_text())
     assert payload["registered"] is True and payload["version"] == "7"
+    assert payload["promoted"] is True and payload["alias"] == "champion"
+    assert payload["promotion"]["decision"] == "champion"
+
+
+def test_registry_cli_exits_zero_for_a_challenger_and_says_how_to_promote_it(
+    artefact: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A candidate that lost the comparison is registered, not failed.
+
+    The DAG task must stay green: the model passed the gate and is in the
+    registry for review. What changes is that it does not serve.
+    """
+    monkeypatch.setattr(
+        registry_module,
+        "register_if_passes",
+        lambda *a, **k: registry_module.RegistrationDecision(
+            registered=True, model_name="credit-risk", version="8"
+        ),
+    )
+    verdict = registry_module.PromotionVerdict(False, ["pr_auc 0.5400 is 0.0268 below"])
+    outcome = registry_module.RegistrationDecision(
+        registered=True, model_name="credit-risk", version="8", stage="Staging", alias="challenger"
+    )
+    monkeypatch.setattr(registry_module, "promote_or_challenge", lambda *a, **k: (verdict, outcome))
+    monkeypatch.setattr(registry_module.mlflow, "set_tracking_uri", lambda uri: None)
+
+    assert registry_module.main(["--result", str(artefact)]) == 0
+
+    payload = json.loads((artefact.parent / "registration.json").read_text())
+    assert payload["promoted"] is False
+    assert payload["alias"] == "challenger"
+    assert payload["promotion"]["reasons"] == ["pr_auc 0.5400 is 0.0268 below"]
+    assert "set-champion --version 8" in capsys.readouterr().err
 
 
 def test_registry_cli_does_not_promote_a_refused_candidate(
@@ -220,6 +260,7 @@ def test_registry_cli_does_not_promote_a_refused_candidate(
         ),
     )
     monkeypatch.setattr(registry_module, "promote", lambda *a, **k: promoted.append(a))
+    monkeypatch.setattr(registry_module, "promote_or_challenge", lambda *a, **k: promoted.append(a))
     monkeypatch.setattr(registry_module.mlflow, "set_tracking_uri", lambda uri: None)
 
     code = registry_module.main(["--result", str(path)])

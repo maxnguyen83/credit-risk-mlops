@@ -67,12 +67,15 @@ logs, `fairness_tradeoff.csv` and `fairness_tradeoff.png` (was P2 #3).
 `README.md` states the invariance bound as exactly 0.0 on the mitigated path,
 which is what
 `tests/model/test_invariance.py::test_flipping_sex_cannot_move_the_mitigated_probability_at_all`
-asserts (was P2 #4). `data/processed/group_thresholds.json` carries
-`"attribute": "SEX"` beside the thresholds, the shape `save_group_thresholds`
-(`fairness/mitigation.py`) writes; the file is git-ignored, so this was checked
-on the main checkout on 2026-10-04. A flat file still loads without the
-attribute check (`tests/unit/test_fairness.py::test_a_flat_thresholds_file_still_loads`)
-(was P2 #5).
+asserts (was P2 #4). `save_group_thresholds` (`fairness/mitigation.py`) writes
+`{"attribute": …, "thresholds": …}`, and every training run whose winner passes
+the gate exports `group_thresholds.json` through it (`models/train.py`);
+`load_group_thresholds` returns no cutoffs when the recorded attribute is not
+the one asked for
+(`tests/unit/test_fairness.py::test_group_thresholds_round_trip_through_the_exported_file`,
+`::test_thresholds_fitted_on_another_attribute_are_refused_not_misapplied`). A
+flat file written before the attribute was recorded still loads, without that
+check (`::test_a_flat_thresholds_file_still_loads`) (was P2 #5).
 
 Serving (P3): `.dockerignore` excludes every path the item listed, plus the
 Alertmanager secrets; the context size after it was not recorded (was P3 #2).

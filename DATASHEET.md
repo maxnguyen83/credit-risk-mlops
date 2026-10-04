@@ -136,7 +136,8 @@ All steps live in `src/credit_risk/data/` and `src/credit_risk/features/`, and
 each is covered by a test:
 
 1. **Download and verify** — fetch the ZIP from UCI (retrying dropped
-   connections and 5xx answers), record its SHA-256, extract the single `.xls`
+   connections, timeouts and HTTP 408, 425, 429, 500, 502, 503 and 504), record
+   its SHA-256, extract the single `.xls`
    member, convert to Parquet. The archive digest and the Parquet's own digest
    go into a sidecar written before the Parquet; a Parquet without a matching
    sidecar is downloaded again. The Excel reader is needed exactly once;
@@ -145,7 +146,10 @@ each is covered by a test:
    more than 5% of rows fail, the pipeline **stops** rather than training.
    Rows that fail below that tolerance are **quarantined**: written as received
    to `data/processed/quarantine.parquet` with the checks they failed, counted
-   in the manifest, and left out of every split. The published file has none.
+   in the manifest, and left out of every split. This includes rows that fail
+   only after cleaning — a category code outside both the dictionary and the
+   folds, such as `EDUCATION` 7 — and the 5% limit counts both stages together.
+   The published file has none.
 3. **Clean** — rename `PAY_0` to `PAY_1` and the target to `default_next_month`;
    fold undocumented category codes; derive `AGE_GROUP` (35 and under / over 35).
 4. **Split** — six deterministic batches of 5,000 by sorted `ID`, with a

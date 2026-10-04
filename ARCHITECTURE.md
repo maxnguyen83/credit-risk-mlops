@@ -152,14 +152,22 @@ keeps its evidence.
 
 **Under the 5% tolerance, bad rows are set aside, not trained on.**
 `clean_and_split` assigns batches over the whole file, then moves every row that
-failed an error-severity check to `data/processed/quarantine.parquet`, as
-received and with the failed checks named. The manifest records
+failed an error-severity check to `data/processed/quarantine.parquet`, with the
+failed checks named. That covers the raw checks and the cleaned-frame checks: a
+category code the folds cannot fix (`EDUCATION` 7, say) is only a warning on the
+raw frame and is quarantined as `clean:education_codes`. The 5% tolerance
+applies to the file across both stages, and the frame that is written must pass
+every error check. Values are kept as received, stored as float64 so the file
+has one schema whether or not it holds a null. The manifest records
 `quarantined_rows` and a count per check. Kept rows stay in the batch they
-arrived in, so a bad row in batch 1 does not change who is in the test set. The
-published file has no such rows, and its split hashes are unchanged.
+arrived in, so a bad row in batch 1 does not change who is in the test set, and
+integer columns stay int64 after a null is removed. The published file has no
+such rows, and its split hashes are unchanged.
 
 **Only transient failures are retried.** `download_raw` retries connection
-errors, timeouts and 408/425/429/5xx itself (4 attempts, 2/4/8 s backoff). If
+errors, timeouts, truncated bodies and HTTP 408, 425, 429, 500, 502, 503 and 504
+itself (4 attempts, 2/4/8 s backoff). Other HTTP errors, TLS failures and proxy
+errors fail at once. If
 the archive stays down it exits 75 (`EX_TEMPFAIL`), the one exit code
 `run_module` maps to a retryable `AirflowException`; Airflow then applies the
 DAG's two retries. Every other non-zero exit is a defect and fails the task
@@ -168,15 +176,21 @@ without a retry.
 **A failed run raises an alert.** The DAG's `on_failure_callback` posts one
 alert per failed task to Alertmanager's v2 API (`ALERTMANAGER_ALERTS_URL`,
 default `http://alertmanager:9093/api/v2/alerts`) with
-`alertname=PipelineTaskFailed`, `severity=critical`, `dag_id` and `task_id`. It
-stays firing for 24 hours unless a successful run resolves it first
-(`on_success_callback`). Neither callback can raise.
+`alertname=PipelineTaskFailed`, `severity=critical`, `dag_id` and `task_id`;
+the description names the downstream tasks that did not run, and says no model
+was registered only when `register_model` is among them. A run that fails with
+no failed task (`dagrun_timeout`) gets one alert with `task_id=dagrun` and
+Airflow's reason. Alerts stay firing for 24 hours unless a successful run
+resolves them first (`on_success_callback`, with a summary so the resolved
+notification is not blank). Neither callback can raise.
 
 **The raw parquet is trusted only with its sidecar.** The download writes the
 parquet and its provenance sidecar (archive SHA-256 plus the parquet's own
-digest) to temporary files and renames them into place, sidecar first. A
-parquet with no sidecar, or one its sidecar does not describe, is downloaded
-again, so a crash cannot leave the manifest with `source_sha256: null`.
+digest) to temporary files unique to that download and renames them into
+place, sidecar first. A parquet with no sidecar, or one its sidecar does not
+describe, is downloaded again, and the splitter ignores such a sidecar, so a
+crash cannot leave the manifest with `source_sha256: null` or with another
+file's digest.
 
 **Batches are cut by `ID`, and `ID` is not time.** The file has no date
 column, so the six "arrivals" are ID ranges. They are not equally risky: the

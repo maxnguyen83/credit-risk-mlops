@@ -8,6 +8,7 @@
 
 # secrets
 .env
+monitoring/alertmanager/secrets/
 
 # local environments and history
 .venv/

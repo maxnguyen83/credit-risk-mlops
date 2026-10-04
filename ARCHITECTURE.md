@@ -92,7 +92,7 @@ flowchart TB
     CLIENT -->|HTTP| API
     PROM -->|"scrape /metrics · 5s"| API
     PROM --> AM
-    AM -->|webhook| TG["Telegram (optional)"]
+    AM -->|"telegram_configs, when a token is mounted"| TG["Telegram (optional)"]
     GRAF --> PROM
 ```
 

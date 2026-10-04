@@ -6,6 +6,9 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+# console uploads and batch-scoring results
+data/incoming/
+data/scored/
 
 # service state
 pg-data/

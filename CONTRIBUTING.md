@@ -26,31 +26,45 @@ fair, which is the same as not knowing whether it works.
 
 ### Files each member owns
 
+Code and tests live on the member's `core` branch, documentation on `docs`.
+
 ```
-P1  src/credit_risk/data/**        src/credit_risk/features/**
-    dags/**                        tests/data_quality/**
-    tests/unit/test_features.py    tests/unit/test_validate.py
-    tests/conftest.py              DATASHEET.md
+P1  core  src/credit_risk/data/**          src/credit_risk/features/**
+          dags/**                          Dockerfile.airflow
+          tests/data_quality/**            tests/conftest.py
+          tests/unit/test_dag.py  test_features.py  test_validate.py
+    docs  ARCHITECTURE.md  REQUIREMENTS.md  DATASHEET.md
+          docs/BACKLOG.md  docs/adr/README.md  docs/adr/0002, 0005, 0006
 
-P2  src/credit_risk/models/**      src/credit_risk/fairness/**
-    tests/model/**                 tests/unit/test_evaluate.py
-    tests/unit/test_fairness.py    MODEL_CARD.md
+P2  core  src/credit_risk/models/**        src/credit_risk/fairness/**
+          Dockerfile.mlflow                tests/model/**
+          tests/unit/test_evaluate.py  test_fairness.py  test_pipeline_cli.py
+          tests/unit/test_registry_*.py
+    docs  MODEL_CARD.md  ETHICS.md  docs/adr/0003, 0007, 0009
 
-P3  src/credit_risk/serving/main.py  routes.py  models.py  model_loader.py
-    src/credit_risk/explain/**     tests/integration/**
-    tests/unit/test_explain.py     Dockerfile*  docker-compose.yml
+P3  core  src/credit_risk/serving/main.py  routes.py  models.py  model_loader.py
+          src/credit_risk/explain/**       tests/integration/**
+          tests/unit/test_explain.py       Dockerfile  .dockerignore
+          docker-compose.yml               docs/openapi.json  docs/examples/**
+    docs  README.md  docs/adr/0001, 0004, 0010
 
-P4  src/credit_risk/serving/metrics.py
-    monitoring/**                  .github/workflows/**
-    scripts/**                     tests/unit/test_metrics.py
+P4  core  src/credit_risk/serving/metrics.py
+          monitoring/**                    .github/**
+          scripts/** except gen_requirements.py
+          tests/unit/test_metrics.py  test_verify_deploy.py
+          docs/ALERTING.md                 .gitattributes
+    docs  CONTRIBUTING.md  docs/RUNNER.md  docs/adr/0008
 ```
 
-Shared, edited by whoever needs to and always reviewed by another member:
-`README.md`, `ARCHITECTURE.md`, `ETHICS.md`, `src/credit_risk/schema.py`,
-`src/credit_risk/config.py`, `pyproject.toml`, `Makefile`.
+Shared, on `main` before any member branch, edited by whoever needs to and
+always reviewed by another member: `src/credit_risk/schema.py`,
+`src/credit_risk/config.py`, `pyproject.toml`, `requirements*.txt` with
+`scripts/gen_requirements.py`, `Makefile`, `.env.example`, `.gitignore` and
+the package skeleton. So far `Makefile` has changed on `p1/core`, `config.py`
+on `p2/core`, and `.env.example` on both `p2/core` and `p3/core`.
 
-`ETHICS.md` is written by **all four** — one section each. Everyone will be
-asked about it.
+`ETHICS.md` is written by **all four** — one section each — and committed on
+`p2/docs`. Everyone will be asked about it.
 
 ---
 

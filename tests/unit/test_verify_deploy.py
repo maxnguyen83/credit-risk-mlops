@@ -453,3 +453,119 @@ def test_cli_fails_cleanly_on_an_unreadable_sample(stub: _Stub, tmp_path: Path) 
     _consistent(stub)
     missing = tmp_path / "missing.json"
     assert _run(stub, "--sample", str(missing), tmp_path=tmp_path) == vd.EXIT_FAILED
+
+
+# ---------------------------------------------------- the champion alias
+
+
+def _alias_route(alias: str = "champion") -> tuple[str, str]:
+    return ("GET", vd.alias_query("credit-risk", alias))
+
+
+def _alias_payload(version: str, stage: str = "Production") -> dict[str, Any]:
+    return {
+        "model_version": {
+            "name": "credit-risk",
+            "version": version,
+            "current_stage": stage,
+            "run_id": f"run{version}abcdef0123",
+            "aliases": ["champion"],
+        }
+    }
+
+
+# What MLflow 2.19 answers when no version carries the alias -- measured
+# against the live registry, whose version 2 predates aliases.
+NO_ALIAS = (
+    400,
+    {
+        "error_code": "INVALID_PARAMETER_VALUE",
+        "message": "Registered model alias champion not found.",
+    },
+)
+
+
+def test_the_alias_decides_when_it_exists(
+    stub: _Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _consistent(stub, "3")
+    # The stage still points at 3; the alias has moved on to 5, and the API
+    # follows the alias, so the deploy check must too.
+    stub.routes[_alias_route()] = (200, _alias_payload("5"))
+
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_OK
+    assert capsys.readouterr().out.strip() == "5"
+
+
+def test_no_alias_falls_back_to_the_stage(
+    stub: _Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _consistent(stub, "2")
+    stub.routes[_alias_route()] = NO_ALIAS
+
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_OK
+    assert capsys.readouterr().out.strip() == "2"
+
+
+def test_no_alias_and_no_stage_is_still_exit_3(stub: _Stub, tmp_path: Path) -> None:
+    # The deploy workflow bootstraps a model on exit 3 and only then.
+    stub.routes[_alias_route()] = NO_ALIAS
+    stub.routes[REGISTRY] = (200, {})
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_NO_VERSION
+
+
+def test_an_alias_lookup_that_errors_is_not_a_missing_alias(stub: _Stub, tmp_path: Path) -> None:
+    # Falling back to the stage on a 500 could approve an API that serves the
+    # stage while the alias -- unreadable, not absent -- names another version.
+    _consistent(stub, "3")
+    stub.routes[_alias_route()] = (500, {"error_code": "INTERNAL_ERROR", "message": "db down"})
+    assert _run(stub, "--registry-version", tmp_path=tmp_path) == vd.EXIT_FAILED
+
+
+def test_the_alias_can_be_chosen_with_a_flag(
+    stub: _Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _consistent(stub, "3")
+    stub.routes[_alias_route("candidate")] = (200, _alias_payload("8"))
+
+    assert _run(stub, "--registry-version", "--alias", "candidate", tmp_path=tmp_path) == 0
+    assert capsys.readouterr().out.strip() == "8"
+
+
+def test_cli_fails_when_the_api_still_serves_the_stage_version_after_an_alias_moved(
+    stub: _Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _consistent(stub, "2")
+    stub.routes[_alias_route()] = (200, _alias_payload("3", stage="Production"))
+
+    assert _run(stub, tmp_path=tmp_path) == vd.EXIT_FAILED
+    out = capsys.readouterr().out
+    assert "serves version 2 but @champion is version 3" in out
+
+
+def test_cli_passes_against_a_stack_serving_the_alias(stub: _Stub, tmp_path: Path) -> None:
+    _consistent(stub, "3")
+    stub.routes[_alias_route()] = (200, _alias_payload("3"))
+    stub.routes[("GET", "/health")] = (200, _health("3", model_ref="alias"))
+    summary = tmp_path / "summary.md"
+
+    assert _run(stub, "--summary", str(summary), tmp_path=tmp_path) == vd.EXIT_OK
+
+    text = summary.read_text(encoding="utf-8")
+    assert "`credit-risk@champion` → version **3**" in text
+    assert "via `alias`" in text
+
+
+def test_the_summary_says_when_the_stage_answered_instead_of_the_alias() -> None:
+    obs = _healthy_observation()
+    text = vd.render_markdown(
+        obs, [], model_name="credit-risk", stage="Production", sample=SAMPLE, alias="champion"
+    )
+    assert "no `@champion` alias" in text
+
+
+def test_an_empty_registry_names_both_places_it_looked() -> None:
+    obs = _healthy_observation()
+    obs.registry = None
+    problems = vd.find_problems(obs, model_name="credit-risk", stage="Production", alias="champion")
+    assert any("has no Production version" in p and "@champion" in p for p in problems)

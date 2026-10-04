@@ -12,9 +12,16 @@ name: Deploy
 # One run, in order:
 #   1. deploy only a commit on main that CI passed -- the exact SHA it tested;
 #   2. rebuild the images and update the stack in place, volumes untouched;
-#   3. register a model if, and only if, the registry has none in Production;
-#   4. restart the API so it loads whatever Production holds now;
+#   3. register a model if, and only if, the registry serves none -- no
+#      version carries the champion alias and none is in Production;
+#   4. restart the API so it loads whatever the champion alias names now
+#      (the Production stage on a registry from before aliases);
 #   5. fail unless the API serves the version the registry says it should.
+#
+# A deploy never promotes a model over an existing champion. Retraining with a
+# champion in place is the DAG's job, and its register step promotes only a
+# candidate that is not worse than the champion; anything else waits as the
+# challenger for `python -m credit_risk.models.registry set-champion`.
 #
 # The runner is assumed to be a macOS host running Docker through Colima, so:
 # no sudo anywhere, bash 3.2-compatible scripts, and `docker compose` v2.
@@ -195,12 +202,14 @@ jobs:
           version=$(python3 scripts/verify_deploy.py --registry-version) || rc=$?
           case "$rc" in
             0)
-              echo "Production already holds version ${version}; not retraining"
+              # The champion alias's version, or Production's when no version
+              # carries the alias -- the order the API resolves them in.
+              echo "the registry already serves version ${version}; not retraining"
               echo "bootstrapped=false" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             3)
-              echo "no Production version yet: running the pipeline once"
+              echo "no champion alias and nothing in Production yet: running the pipeline once"
               ;;
             *)
               # Exit 1 is "could not read the registry", which is not "empty":
@@ -211,20 +220,22 @@ jobs:
           esac
           # The same command as `make dag-test`: download, validate, split,
           # train, gate, register, report. Registration happens only if the
-          # performance and fairness gates pass.
+          # performance and fairness gates pass; with no champion to compare
+          # against, the registered model is promoted and gets the alias.
           docker compose exec -T airflow \
             airflow dags test credit_risk_pipeline "$(date -u +%Y-%m-%d)"
           if ! version=$(python3 scripts/verify_deploy.py --registry-version); then
-            echo "::error::the pipeline ran but nothing reached Production: the gate refused the candidate or a task failed (see the DAG output above)"
+            echo "::error::the pipeline ran but no version became the champion: the gate refused the candidate or a task failed (see the DAG output above)"
             exit 1
           fi
           echo "registered and promoted version ${version}"
           echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
 
-      - name: Restart the API so it loads the current Production model
-        # The model is resolved once, at startup (D3). Without this restart a
-        # promotion made since the API booted stays invisible: health green,
-        # version stale. verify_deploy.py below is what would catch it.
+      - name: Restart the API so it loads the current champion
+        # The model is resolved once, at startup (D3): the champion alias, else
+        # the Production stage. Without this restart a promotion made since the
+        # API booted -- by the DAG or by set-champion -- stays invisible: health
+        # green, version stale. verify_deploy.py below is what would catch it.
         run: docker compose restart credit-api
 
       - name: Wait for every service, the API included
@@ -233,7 +244,8 @@ jobs:
           WAIT_SECONDS: "300"
         run: ./scripts/stack_health.sh wait
 
-      - name: Verify the API serves the registry's Production model
+      - name: Verify the API serves the registry's champion
+        # Alias first, Production stage as the fallback; the summary says which.
         timeout-minutes: 5
         run: >-
           python3 scripts/verify_deploy.py

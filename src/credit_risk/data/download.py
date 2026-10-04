@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import tempfile
 import zipfile
 from collections.abc import Sequence
@@ -131,18 +132,72 @@ def _read_archive(payload: bytes) -> pd.DataFrame:
             return pd.read_excel(extracted, header=schema.EXCEL_HEADER_ROW)
 
 
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _completed_download(target: Path) -> tuple[bool, str]:
+    """Whether ``target`` is a finished download, and if not, why not.
+
+    Finished means the parquet exists *and* a sidecar describes it. A parquet
+    on its own is what a crash between the two writes used to leave behind,
+    and trusting it meant every later manifest said ``source_sha256: null``.
+    """
+    if not target.exists():
+        return False, "no parquet"
+    metadata = load_raw_metadata(target)
+    if not metadata.get("sha256"):
+        return False, "no provenance sidecar describes it"
+    recorded = metadata.get("parquet_sha256")
+    if recorded is None:
+        # A sidecar written before the parquet digest was recorded. It still
+        # names the archive, which is all the manifest needs from it.
+        return True, "sidecar predates the parquet digest"
+    if recorded != _file_sha256(target):
+        return False, "it is not the parquet its sidecar describes"
+    return True, "parquet matches its sidecar"
+
+
+def _write_download(frame: pd.DataFrame, metadata: dict[str, Any], target: Path) -> None:
+    """Write the parquet and its sidecar so that no crash leaves an orphan parquet.
+
+    Both go to temporary files first and are renamed into place, the sidecar
+    before the parquet. A crash before the first rename changes nothing; one
+    between the renames leaves a sidecar whose ``parquet_sha256`` the parquet on
+    disk (old, or absent) does not match, which the next run re-downloads.
+    """
+    meta_path = raw_meta_path(target)
+    tmp_parquet = target.with_name(target.name + ".tmp")
+    tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
+    try:
+        frame.to_parquet(tmp_parquet, index=False)
+        sidecar = {**metadata, "parquet_sha256": _file_sha256(tmp_parquet)}
+        tmp_meta.write_text(json.dumps(sidecar, indent=2) + "\n")
+        os.replace(tmp_meta, meta_path)
+        os.replace(tmp_parquet, target)
+    finally:
+        tmp_parquet.unlink(missing_ok=True)
+        tmp_meta.unlink(missing_ok=True)
+
+
 def download_raw(dest: Path | None = None, force: bool = False) -> Path:
     """Download the UCI archive and write it to parquet, returning that path.
 
-    Idempotent: an existing parquet short-circuits the network unless
-    ``force`` is set, so re-running the DAG does not re-download 5.5 MB.
+    Idempotent: a finished download -- the parquet plus the sidecar that
+    describes it -- short-circuits the network unless ``force`` is set, so
+    re-running the DAG does not re-download 5.5 MB. A parquet with no sidecar,
+    or one its sidecar does not describe, is downloaded again.
     """
     target = Path(dest) if dest is not None else raw_parquet_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if target.exists() and not force:
-        log.info("raw parquet already at %s; skipping download", target)
-        return target
+    if not force:
+        complete, why = _completed_download(target)
+        if complete:
+            log.info("raw parquet already at %s (%s); skipping download", target, why)
+            return target
+        if target.exists():
+            log.warning("raw parquet at %s exists but %s; downloading again", target, why)
 
     log.info("downloading %s", schema.DATASET_URL)
     payload = _fetch(schema.DATASET_URL)
@@ -158,8 +213,6 @@ def download_raw(dest: Path | None = None, force: bool = False) -> Path:
         )
 
     frame = _read_archive(payload)
-    frame.to_parquet(target, index=False)
-
     metadata: dict[str, Any] = {
         "url": schema.DATASET_URL,
         "sha256": digest,
@@ -169,7 +222,7 @@ def download_raw(dest: Path | None = None, force: bool = False) -> Path:
         "n_cols": int(frame.shape[1]),
         "downloaded_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
-    raw_meta_path(target).write_text(json.dumps(metadata, indent=2) + "\n")
+    _write_download(frame, metadata, target)
 
     log.info("wrote %s (%d rows x %d cols)", target, frame.shape[0], frame.shape[1])
     return target

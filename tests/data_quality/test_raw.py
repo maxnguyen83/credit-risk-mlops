@@ -12,6 +12,7 @@ ingestion tests below them stub the network and run everywhere.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import zipfile
@@ -130,13 +131,78 @@ class TestIngestion:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
     ) -> None:
         dest = tmp_path / "credit_default_raw.parquet"
-        synthetic_raw_df.to_parquet(dest, index=False)
+        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
+        download_raw(dest=dest)
 
         def explode(url: str) -> bytes:
             raise AssertionError(f"re-downloaded {url} when the parquet already existed")
 
         monkeypatch.setattr(download_module, "_fetch", explode)
         assert download_raw(dest=dest) == dest
+
+    def test_a_parquet_without_its_sidecar_is_downloaded_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        """A crash between the two writes used to leave exactly this, and the
+        next run skipped the download and wrote source_sha256: null forever."""
+        dest = tmp_path / "raw.parquet"
+        synthetic_raw_df.to_parquet(dest, index=False)
+        calls: list[str] = []
+
+        def record(url: str) -> bytes:
+            calls.append(url)
+            return b"pretend-zip"
+
+        monkeypatch.setattr(download_module, "_fetch", record)
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
+
+        download_raw(dest=dest)
+
+        assert calls == [schema.DATASET_URL]
+        assert len(load_raw_metadata(dest)["sha256"]) == 64
+
+    def test_a_parquet_that_is_not_the_one_its_sidecar_describes_is_downloaded_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        dest = tmp_path / "raw.parquet"
+        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
+        download_raw(dest=dest)
+        synthetic_raw_df.head(10).to_parquet(dest, index=False)  # replaced behind its back
+
+        calls: list[str] = []
+        monkeypatch.setattr(download_module, "_fetch", lambda url: calls.append(url) or b"zip")
+        download_raw(dest=dest)
+
+        assert calls == [schema.DATASET_URL]
+        assert len(pd.read_parquet(dest)) == len(synthetic_raw_df)
+
+    def test_a_crash_mid_download_never_leaves_a_parquet_without_a_sidecar(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
+    ) -> None:
+        """Whatever fails part way through, the next run must not find a
+        parquet it would trust without knowing where it came from."""
+
+        class Crash(RuntimeError):
+            pass
+
+        class ClockThatDies:
+            @staticmethod
+            def now(tz: object = None) -> object:
+                raise Crash("killed between the two writes")
+
+        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
+        monkeypatch.setattr(download_module, "datetime", ClockThatDies)
+        dest = tmp_path / "raw.parquet"
+
+        with pytest.raises(Crash):
+            download_raw(dest=dest)
+
+        assert not dest.exists() or raw_meta_path(dest).exists()
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+        assert leftovers == []
 
     def test_download_writes_parquet_and_records_the_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
@@ -155,6 +221,9 @@ class TestIngestion:
         assert metadata["n_bytes"] == len(payload)
         assert metadata["n_rows"] == len(synthetic_raw_df)
         assert metadata["n_cols"] == schema.RAW_N_COLS
+        # The sidecar names the exact parquet it describes, so a parquet
+        # swapped in later is recognised as a different file.
+        assert metadata["parquet_sha256"] == hashlib.sha256(dest.read_bytes()).hexdigest()
 
     def test_force_refetches_even_when_the_parquet_exists(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_raw_df: pd.DataFrame
@@ -180,10 +249,15 @@ class TestIngestion:
             load_raw(tmp_path / "absent.parquet")
 
     def test_cli_prints_the_parquet_path(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], synthetic_raw_df: pd.DataFrame
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        synthetic_raw_df: pd.DataFrame,
     ) -> None:
         dest = tmp_path / "raw.parquet"
-        synthetic_raw_df.to_parquet(dest, index=False)
+        monkeypatch.setattr(download_module, "_fetch", lambda url: b"pretend-zip")
+        monkeypatch.setattr(download_module, "_read_archive", lambda blob: synthetic_raw_df)
 
         assert download_module.main(["--dest", str(dest)]) == 0
         assert capsys.readouterr().out.strip() == str(dest)

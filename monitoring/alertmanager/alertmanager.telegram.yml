@@ -1,34 +1,28 @@
-# Alertmanager routing -- the config the stack starts with.
+# Alertmanager routing -- the config the stack runs when Telegram is set up.
 #
-# Two configs share one routing tree:
+# Never started directly: entrypoint.sh copies this file to /tmp, fills in the
+# chat id from the secrets mount, checks the result with amtool and only then
+# starts Alertmanager on it. Any problem on the way and it starts on
+# alertmanager.yml instead, with a WARNING in the container log. Turning it on
+# is docs/ALERTING.md.
 #
-#   alertmanager.yml           this file. Every receiver is a no-op: alerts are
-#                              grouped, deduplicated, inhibited and shown in the
-#                              Alertmanager UI and in Grafana, and go no further.
-#   alertmanager.telegram.yml  the same `route:` and `inhibit_rules:`, with the
-#                              receivers wired to a Telegram chat.
+# Secrets stay out of this file. The bot token is read by Alertmanager itself
+# from bot_token_file, on every notification, so replacing the token needs no
+# restart. The chat id has no *_file option in Alertmanager v0.27, which is why
+# the entrypoint substitutes it -- in a copy inside the container, never here.
 #
-# entrypoint.sh picks one at container start: the Telegram config when a bot
-# token AND a chat id are present in the read-only secrets mount, this one in
-# every other case. Nothing secret is ever written into either file, and the
-# stack starts with no secret at all. Turning delivery on is docs/ALERTING.md.
-#
-# Why two files and a switch rather than one file with blank credentials:
-# Alertmanager validates every receiver at startup and exits if one is
-# malformed, and a telegram_config without a chat id is malformed. A notifier
-# nobody configured must never be the reason the alert UI is down -- and one
-# that retries every notification against a bot that does not exist is not
-# "off" either, it is failing quietly.
-#
-# Everything from `route:` down to `receivers:` must stay byte-identical
-# between the two files; tests/test_config.sh fails CI when it is not. The
-# receiver NAMES are the same in both, so a route test reads the same either
-# way -- only what a receiver does with an alert differs.
+# Everything from `route:` down to `receivers:` is byte-identical to
+# alertmanager.yml (tests/test_config.sh fails CI when it is not): change the
+# routing there and copy the section across. What differs is the receivers --
+# same names, real integrations.
 
 global:
   resolve_timeout: 5m
 
-templates: []
+templates:
+  # Absolute: the running copy lives in /tmp, and relative template paths are
+  # resolved against the config file's own directory.
+  - /etc/alertmanager/templates/*.tmpl
 
 route:
   # Fallback for anything no child route matches, e.g. an alert from a new tool
@@ -114,10 +108,33 @@ inhibit_rules:
     equal: ["stack"]
 
 receivers:
-  # No integrations on any of them, on purpose: this is the config the stack
-  # runs when nobody has configured a notifier. The routing above still runs,
-  # so the UI shows which receiver each alert WOULD have gone to.
   - name: "null"
+
+  # Pages. Sends a resolved message too, so whoever was paged knows it is over.
   - name: critical
+    telegram_configs:
+      - &telegram
+        bot_token_file: /run/secrets/alertmanager/telegram_bot_token
+        # Placeholder, kept a valid integer so this file passes amtool on its
+        # own. entrypoint.sh replaces this line from telegram_chat_id; never
+        # write a real chat id here.
+        chat_id: 1 # @TELEGRAM_CHAT_ID@
+        parse_mode: HTML
+        message: '{{ template "credit.telegram.message" . }}'
+        send_resolved: true
+
+  # Same chat, delivered silently: it shows up, it does not buzz. A warning is
+  # read during working hours, not at 3am.
   - name: warning
+    telegram_configs:
+      - <<: *telegram
+        disable_notifications: true
+
+  # No resolved message. A pipeline failure is an event, not a state: the
+  # callback posts it once, and Alertmanager times it out after
+  # resolve_timeout. A "RESOLVED" five minutes later would claim the pipeline
+  # was fixed when nothing happened at all.
   - name: pipeline
+    telegram_configs:
+      - <<: *telegram
+        send_resolved: false

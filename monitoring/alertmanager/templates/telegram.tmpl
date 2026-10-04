@@ -1,0 +1,27 @@
+{{/*
+  The one Telegram message every receiver in alertmanager.telegram.yml sends.
+
+  parse_mode is HTML, so every value that comes from a label or an annotation
+  goes through `html`. Without it a single "<" -- an Airflow exception such as
+  "<class 'KeyError'>" in a PipelineTaskFailed description is enough -- makes
+  Telegram reject the whole message, and the alert is lost with nothing but a
+  line in the Alertmanager log to show for it.
+
+  Header: status, how many, severity, and the alert name when the group has
+  only one. Then one block per alert: name and summary, the DAG and task for a
+  pipeline failure, the description. Alertmanager cuts the result at Telegram's
+  4096-character limit.
+*/}}
+{{ define "credit.telegram.message" -}}
+<b>[{{ .Status | toUpper }}{{ if eq .Status "firing" }} x{{ .Alerts.Firing | len }}{{ end }}]</b>
+{{- with .CommonLabels.severity }} {{ . | html }}{{ end }}
+{{- with .CommonLabels.alertname }} <b>{{ . | html }}</b>{{ end }}
+{{ range .Alerts }}
+• {{ if ne .Status $.Status }}[{{ .Status }}] {{ end }}<b>{{ .Labels.alertname | html }}</b>: {{ or .Annotations.summary "no summary" | html }}
+{{- with .Labels.dag_id }}
+dag <code>{{ . | html }}</code>{{ end }}
+{{- with .Labels.task_id }} task <code>{{ . | html }}</code>{{ end }}
+{{- with .Annotations.description }}
+{{ . | html }}{{ end }}
+{{ end -}}
+{{- end }}

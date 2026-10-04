@@ -1,0 +1,90 @@
+# Model-level alerts: conditions that a port check, a load balancer health probe
+# or an HTTP status code cannot see.
+
+groups:
+  - name: credit-model.readiness
+    interval: 15s
+    rules:
+      - alert: ModelNotLoaded
+        # This is the alert that justifies the whole gauge. The API starts, binds
+        # the port, answers /health with 200 and returns 503 from every single
+        # prediction -- because MLflow was not reachable at startup and no model
+        # was pulled from the registry. A TCP check calls that healthy. A status
+        # page calls that healthy. The business gets zero scored accounts.
+        expr: credit_model_loaded == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: model
+        annotations:
+          summary: "credit-api is up but serving no model"
+          description: >-
+            The API on {{ $labels.instance }} has been running in degraded mode
+            for over two minutes: it accepts connections and every /predict call
+            returns 503. Check that MLflow is healthy and that a version of
+            `credit-risk` is actually in the Production stage -- an empty stage
+            looks identical to an unreachable registry from in here.
+
+  - name: credit-model.behaviour
+    interval: 15s
+    rules:
+      - alert: HighRiskShareShift
+        # Compared against what this model actually flagged at registration, not
+        # against the 22.12% label prevalence. Those are different quantities:
+        # prevalence is how many accounts default, the gauge is how many the
+        # model puts on the intervention list, and they coincide only for a
+        # near-perfect classifier. A model at the project's PR-AUC target flags
+        # roughly half that at a 0.5 cutoff -- so the earlier version of this
+        # rule, `abs(share - 0.2212) > 0.10`, sat on its own trip point under
+        # entirely normal traffic and would have been muted in its first week.
+        #
+        # The `> 0` guard is not cosmetic: prometheus_client exports an unset
+        # gauge as 0, so until the serving process installs the baseline from
+        # registry metadata this rule would read the live share as a 10-point
+        # drift from zero. No baseline, no alert, which is the honest default.
+        #
+        # The live side has the same problem and is fixed at the source: the API
+        # publishes credit_high_risk_share as NaN until it has scored 50 requests
+        # since it started (HIGH_RISK_SHARE_MIN_SAMPLES in serving/metrics.py).
+        # Every comparison with NaN is false, so a freshly restarted API with no
+        # traffic -- which used to export 0 and fire this rule for as long as it
+        # sat idle -- now produces no sample here at all.
+        expr: |
+          abs(credit_high_risk_share - credit_baseline_high_risk_share) > 0.10
+            and credit_baseline_high_risk_share > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "Predicted high-risk share has drifted from what this model flagged at registration"
+          description: >-
+            The rolling share of accounts scored above the decision threshold has
+            moved more than 10 points away from credit_baseline_high_risk_share,
+            the rate this model produced on its evaluation set, and has stayed
+            there for 15 minutes. Cross-check against credit_feature_psi: if PSI
+            also moved, the input distribution changed; if PSI is flat, suspect
+            the threshold or the model version.
+
+      - alert: FeatureDriftHigh
+        # Grouped by feature rather than collapsed with max(), so the alert
+        # carries the name of the offending column. `max(...) > 0.25` fires with
+        # an empty label set and leaves the on-call grepping the dashboard for
+        # which of twelve features moved.
+        #
+        # 0.25 is the standard PSI reading: below 0.10 stable, 0.10-0.25 moderate,
+        # above 0.25 a significant shift away from the training distribution.
+        expr: max by (feature) (credit_feature_psi) > 0.25
+        for: 20m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "Feature {{ $labels.feature }} has drifted away from its training distribution"
+          description: >-
+            Population Stability Index for {{ $labels.feature }} is
+            {{ $value | printf "%.3f" }}, above the 0.25 significant-shift
+            threshold, and has stayed there for 20 minutes. The model is being
+            asked about a population it was not fitted on. This does not trigger
+            a retrain by itself -- by design; a human decides, and the pipeline
+            is re-run against fresh batches.

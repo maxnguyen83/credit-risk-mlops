@@ -251,8 +251,8 @@ chapter "9" "What is left running"
 
 say "Every rule Prometheus is evaluating, read back from Prometheus itself rather than from the YAML — the count below is whatever actually loaded:"
 rules
-point "Alertmanager  ${ALERTMANAGER_URL}  — grouped by alertname and severity, repeat every 4h"
-point "Telegram is defined but unreferenced: every route, including the severity routes, lands on the null receiver. Alerts are recorded and displayed and go no further. Turning it on is four lines documented in alertmanager.yml — an unconfigured notifier must never be able to stop the stack from starting, and a notifier that quietly retries against a bot that does not exist is not 'off'."
+point "Alertmanager  ${ALERTMANAGER_URL}  — routed by severity: critical and pipeline failures within seconds, warnings grouped per component, info never sent"
+point "Delivery is a switch, not an edit: with a Telegram bot token and chat id mounted as files, the same routes deliver to that chat; without them every receiver is a no-op and alerts are recorded and displayed only. Anything incomplete falls back to no-op with a warning — an unconfigured notifier must never stop the stack from starting, and one that retries against a bot that does not exist is not 'off'. docs/ALERTING.md has the steps."
 say
 say "To reset: docker compose down -v"
 say "To re-run any single scenario:  make traffic | make drift | make bias"

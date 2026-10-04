@@ -204,6 +204,9 @@ services:
       - -c
       - |
         airflow db migrate > /dev/null
+        # The default roles only exist once permissions are synced; without
+        # this the create fails on a fresh database and the console gets 401.
+        airflow sync-perm > /dev/null
         airflow users create --role User --username "$${CONSOLE_AIRFLOW_USER}" \
           --password "$${CONSOLE_AIRFLOW_PASSWORD}" --firstname Console --lastname UI \
           --email console@example.invalid > /dev/null 2>&1 || true

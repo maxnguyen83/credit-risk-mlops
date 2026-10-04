@@ -45,6 +45,11 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The console's page ships inside the package: the images install it with a
+# non-editable `pip install .`, which copies only .py files unless told otherwise.
+[tool.setuptools.package-data]
+"credit_risk.console" = ["static/*.html", "static/*.css", "static/*.js"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

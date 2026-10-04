@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Cảnh báo sớm vỡ nợ — Bảng điều khiển</title>
+  <link rel="stylesheet" href="/static/console.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f5fbf'/%3E%3Cpath d='M8 21l6-6 4 4 6-8' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg></span>
+        <div>
+          <h1>Cảnh báo sớm vỡ nợ — Bảng điều khiển</h1>
+          <p class="subtitle">Xếp hạng khách hàng thẻ tín dụng theo nguy cơ vỡ nợ tháng tới. Model chỉ đề xuất danh sách cần liên hệ; cán bộ tín dụng quyết định cuối cùng.</p>
+        </div>
+      </div>
+      <div class="status">
+        <span id="airflow-chip" class="chip chip-wait"><span class="dot"></span><span id="airflow-chip-text">Đang kết nối Airflow…</span></span>
+        <span id="updated-at" class="muted small"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <div id="airflow-banner" class="banner banner-bad" role="alert" hidden></div>
+
+    <section class="card" id="training" aria-labelledby="training-title">
+      <div class="section-head">
+        <div class="section-title">
+          <span class="step" aria-hidden="true">1</span>
+          <div>
+            <h2 id="training-title">Pipeline huấn luyện model</h2>
+            <p class="muted">Tải dữ liệu, kiểm tra chất lượng, huấn luyện, kiểm định hiệu năng và công bằng, rồi mới đăng ký model mới.</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="train-button">▶ Chạy pipeline huấn luyện</button>
+        </div>
+      </div>
+      <div class="confirm" id="train-confirm" hidden>
+        <p><strong>Chạy lại toàn bộ huấn luyện?</strong> Mất vài phút. Model mới chỉ được đưa vào phục vụ nếu vượt qua các cổng kiểm định hiệu năng và công bằng.</p>
+        <div class="confirm-actions">
+          <button type="button" class="btn btn-primary" id="train-confirm-yes">Xác nhận chạy</button>
+          <button type="button" class="btn" id="train-confirm-no">Huỷ</button>
+        </div>
+      </div>
+      <p class="flash" id="training-flash" role="status" hidden></p>
+      <div class="run-meta" id="training-meta"></div>
+      <ol class="flow" id="training-flow" aria-label="Các bước của pipeline huấn luyện"></ol>
+    </section>
+
+    <section class="card" id="scoring" aria-labelledby="scoring-title">
+      <div class="section-head">
+        <div class="section-title">
+          <span class="step" aria-hidden="true">2</span>
+          <div>
+            <h2 id="scoring-title">Pipeline chấm điểm khách hàng</h2>
+            <p class="muted">Kiểm tra file, chấm điểm bằng model đang phục vụ và xuất danh sách khách cần gọi.</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="sample-button">▶ Chấm điểm danh sách mẫu (5.000 khách)</button>
+          <label class="btn" id="upload-label" for="upload-input">⬆ Tải lên file khách mới (CSV)</label>
+          <input type="file" id="upload-input" class="visually-hidden" accept=".csv,text/csv">
+        </div>
+      </div>
+      <p class="hint"><strong>Có file mới là pipeline tự chạy:</strong> hệ thống lưu file, kiểm tra từng dòng, chấm điểm và cập nhật mục 3 ngay khi xong.</p>
+      <details class="format">
+        <summary>Định dạng file CSV</summary>
+        <p>Dòng đầu là tiêu đề, mã hoá UTF-8, tối đa <span id="max-size">5 MB</span>. Bắt buộc có các cột:</p>
+        <p class="columns" id="required-columns">—</p>
+        <p class="muted small">Nên có thêm cột <code>ID</code> (mã khách hàng) để danh sách gọi hiển thị đúng mã. Các cột khác được bỏ qua.</p>
+      </details>
+      <p class="flash" id="scoring-flash" role="status" hidden></p>
+      <div class="run-meta" id="scoring-meta"></div>
+      <ol class="flow" id="scoring-flow" aria-label="Các bước của pipeline chấm điểm"></ol>
+    </section>
+
+    <section class="card" id="results" aria-labelledby="results-title">
+      <div class="section-head">
+        <div class="section-title">
+          <span class="step" aria-hidden="true">3</span>
+          <div>
+            <h2 id="results-title">Kết quả lần chấm gần nhất</h2>
+            <p class="muted" id="results-source">Danh sách khách cần gọi, xếp theo xác suất vỡ nợ giảm dần.</p>
+          </div>
+        </div>
+        <div class="actions">
+          <a class="btn" id="download-call-list" href="/api/results/latest/call_list.csv" download aria-disabled="true">⬇ Tải call_list.csv</a>
+          <a class="btn" id="download-scores" href="/api/results/latest/scores.csv" download aria-disabled="true">⬇ Tải scores.csv</a>
+        </div>
+      </div>
+      <div class="empty" id="results-empty" hidden>
+        <p class="empty-title">Chưa có kết quả</p>
+        <p class="muted" id="results-empty-reason"></p>
+      </div>
+      <div id="results-body" hidden>
+        <div class="kpis" id="kpis"></div>
+        <div class="table-wrap">
+          <table class="call-table">
+            <thead>
+              <tr>
+                <th scope="col" class="num">Hạng</th>
+                <th scope="col">Mã khách hàng</th>
+                <th scope="col">Xác suất vỡ nợ</th>
+                <th scope="col">Mức rủi ro</th>
+                <th scope="col">Lý do chính</th>
+              </tr>
+            </thead>
+            <tbody id="call-rows"></tbody>
+          </table>
+        </div>
+        <p class="muted small" id="table-caption"></p>
+      </div>
+    </section>
+
+    <section class="card" id="links" aria-labelledby="links-title">
+      <div class="section-head">
+        <div class="section-title">
+          <span class="step" aria-hidden="true">4</span>
+          <div>
+            <h2 id="links-title">Liên kết hệ thống</h2>
+            <p class="muted">Các công cụ phía sau bảng điều khiển, mở trong tab mới.</p>
+          </div>
+        </div>
+      </div>
+      <div class="link-grid" id="link-grid"></div>
+    </section>
+  </main>
+
+  <footer class="footer muted small">DDM501 · Hệ thống cảnh báo sớm vỡ nợ thẻ tín dụng · Dữ liệu minh hoạ từ bộ UCI “Default of Credit Card Clients”.</footer>
+
+  <script src="/static/console.js" defer></script>
+</body>
+</html>

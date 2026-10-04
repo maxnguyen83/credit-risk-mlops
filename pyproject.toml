@@ -23,7 +23,7 @@ dependencies = [
     # removed. Without this pin, pip resolves 2.1.x and the tracking server
     # dies on startup with an ImportError -- but only when a SQL backend store
     # is configured, so it passes locally and fails in compose.
-    "sqlalchemy==2.0.36",
+    "sqlalchemy==2.1.1",
     "boto3==1.35.90",
     "fastapi==0.115.6",
     "uvicorn[standard]==0.34.0",

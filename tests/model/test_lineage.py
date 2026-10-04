@@ -75,6 +75,22 @@ def test_a_manifest_that_describes_other_data_is_not_adopted(tmp_path: Path) -> 
     assert lineage.manifest_path is None
 
 
+def test_a_manifest_whose_train_hash_differs_is_not_adopted(tmp_path: Path) -> None:
+    # Same held-out rows, different training rows: the manifest is somebody
+    # else's training set, and adopting it would credit this model to it.
+    train_df, test_df = written_splits(tmp_path)
+    manifest_path = tmp_path / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["splits"]["train"]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest))
+
+    lineage = data_lineage(train_df, test_df, tmp_path)
+
+    assert lineage.params[MANIFEST_PARAM] == "mismatch"
+    assert lineage.params[SOURCE_SHA_PARAM] == "unknown"
+    assert lineage.manifest_path is None
+
+
 @pytest.mark.parametrize(("content", "status"), [(None, "absent"), ("{not json", "unreadable")])
 def test_no_usable_manifest_still_records_the_frame_hashes(
     tmp_path: Path, content: str | None, status: str

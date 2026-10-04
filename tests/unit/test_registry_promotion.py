@@ -532,6 +532,65 @@ def test_a_challenger_that_cannot_be_recorded_fails_the_command(
     assert alias_holder(CHAMPION) == "1"
 
 
+# --------------------------------------------------- comparison edge cases
+
+
+def test_the_tolerance_boundary_is_inclusive(sqlite_mlflow: str, tmp_path: Path) -> None:
+    register(tmp_path, sqlite_mlflow, 0.600)
+
+    # 0.600 - 0.595 is 0.0050000000000000044 in floating point: exactly the
+    # tolerance, so it must promote, not lose to the last bit.
+    assert register(tmp_path, sqlite_mlflow, 0.595)["promoted"] is True
+    assert alias_holder(CHAMPION) == "2"
+
+
+def test_a_candidate_from_the_champions_own_run_is_promoted_whatever_its_number(
+    sqlite_mlflow: str,
+) -> None:
+    run_id = logged_run(0.60)
+    champion = register_if_passes(run_id, {"pr_auc": 0.60}, FAIR_ENOUGH)
+    assert champion.version is not None and set_champion(champion.version).registered
+
+    # The same run registered again is the same model; a stale or partial
+    # number in the hand-off must not demote it.
+    verdict = compare_with_champion(run_id, {"pr_auc": 0.10})
+
+    assert verdict.promote is True
+    assert "same run" in verdict.reasons[0]
+
+
+def test_the_comparison_is_with_the_alias_when_alias_and_stage_disagree(
+    sqlite_mlflow: str,
+) -> None:
+    stage_only = register_if_passes(logged_run(0.70), {"pr_auc": 0.70}, FAIR_ENOUGH)
+    aliased = register_if_passes(logged_run(0.55), {"pr_auc": 0.55}, FAIR_ENOUGH)
+    assert stage_only.version == "1" and aliased.version == "2"
+    registry.promote("1", settings.model_stage)
+    MlflowClient().set_registered_model_alias(MODEL, CHAMPION, "2")
+
+    # 0.58 beats the alias's 0.55 and loses to the stage's 0.70. The alias is
+    # what serves, so it is what the candidate has to beat.
+    verdict = compare_with_champion(logged_run(0.58), {"pr_auc": 0.58})
+
+    assert verdict.champion_version == "2"
+    assert verdict.promote is True
+
+
+def test_a_champion_without_split_hashes_is_compared_as_logged_and_says_so(
+    sqlite_mlflow: str, tmp_path: Path
+) -> None:
+    # The live registry's version 2: its run predates the split hashes, so the
+    # held-out split cannot be checked. The comparison still runs, and the
+    # version records that it was unverified.
+    register(tmp_path, sqlite_mlflow, 0.5668, split=None)
+
+    written = register(tmp_path, sqlite_mlflow, 0.5701)
+
+    assert written["promoted"] is True
+    reason = version("2").tags[PROMOTION_REASON_TAG]
+    assert "held-out split hash not recorded on champion v1" in reason
+
+
 # ------------------------------------------------------------- contracts
 
 
